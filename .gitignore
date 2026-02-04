@@ -1,0 +1,15 @@
+# Ignore everything in these directories
+Database/*
+__pycache__/*
+
+#Ignore these files
+Models/*
+
+
+#Exclude these files from being ignored
+!Database/.gitkeep
+!Models/.gitkeep
+
+
+
+
