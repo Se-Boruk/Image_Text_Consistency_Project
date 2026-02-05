@@ -7,6 +7,7 @@ from DataBase_functions import Async_DataLoader
 import torch
 from tqdm import tqdm
 
+import DataBase_functions as d_func
 
 import Config
 
@@ -49,7 +50,15 @@ manager = Custom_DataSet_Manager(DataSet_path = DATABASE_PATH,
 #Load dataset
 Train_set, Val_set, Test_set = manager.load_dataset_from_disk()
 
+#Verify stratified splits (different datasets could cause not optimal learning. Theyre stratified by the source)
+print("="*60)
+print("\nStratification test:")
+d_func.verify_splits(Train_set, Val_set, Test_set)
 
+
+print("="*60)
+print("\nHash verification if dataset splits are the same across runs:")
+d_func.verify_dataset_integrity(Train_set, Val_set, Test_set, Config.SPLIT_HASHES)
 
 ###################################################################
 # ( 3 ) Setting parameters
@@ -102,7 +111,7 @@ test_loader = Async_DataLoader(dataset = Test_set,
                                 )
 
 
-
+jghjgh
 
 for e in range(EPOCHS):
     #################################################

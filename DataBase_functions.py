@@ -9,6 +9,13 @@ import math
 import torch.nn.functional as F
 import torch
 from PIL import Image as PILImage
+from collections import Counter
+from datasets import ClassLabel
+import hashlib
+
+
+from Config import SOURCE_MAP
+
 
 
 
@@ -24,6 +31,50 @@ class DummyTokenizer:
         
         return tokens
 
+
+
+
+def verify_splits(train, val, test):
+    for name, ds in [("Train", train), ("Val", val), ("Test", test)]:
+        counts = Counter(ds['dataset_source'])
+        total = len(ds)
+        print(f"\n{name} Distribution ({total} samples):")
+        for src, count in counts.items():
+            print(f" - {src}: {count} ({count/total:.2%})")
+
+def verify_dataset_integrity(train_ds, val_ds, test_ds, expected_hashes=None):
+
+    
+    samples = {
+        "train": str(train_ds[0]['caption']),
+        "val": str(val_ds[0]['caption']),
+        "test": str(test_ds[0]['caption'])
+    }
+    
+    current_hashes = {}
+    
+    for split_name, text in samples.items():
+        #hASH FOR CAPTION
+        h = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        current_hashes[split_name] = h
+
+        
+    if expected_hashes:
+        mismatch = False
+        for split in ["train", "val", "test"]:
+            if current_hashes[split] != expected_hashes.get(split):
+                print(f"ERROR: {split} hash mismatch!")
+                mismatch = True
+        
+        if not mismatch:
+            print("All hashes match. Dataset splits are consistent.")
+        else:
+            raise ValueError("Integrity check failed! Splits are different than expected.")
+    else:
+        print("No expected hashes provided. Copy the values above to Config")
+        for split, h in current_hashes.items():
+            print(f"{split.capitalize()} first sample hash: {h}")
+        
 
 
 
@@ -90,19 +141,31 @@ class Custom_DataSet_Manager():
         return train, val, test
     
     def split_dataset(self,dataset):
-        #Split dataset into train, val and test. Ready for work :). 
-        #OFc with given random state or diseaster 
+
         
-        #Train bc this dataset (at least the one for reconstruction - upscaling one may 
-        #be different and require changes/addons) has only train. 
-        #We need to split it on our own
+        #takint unique classes and print them
+        unique_sources = dataset.unique("dataset_source")
+        print(f"Detected unique sources: {unique_sources}")
         
-        #Just load the data and shuffle it (so we mix the classes and hopefully mix them uniformly for training)
-        #Cant use stratifying as we do not know the classes a priori (unsupervised learning)
+        #Encoding data source to number so it can be used in stratification
+        dataset = dataset.map(
+                lambda x: {"dataset_source": [s.lower() for s in x["dataset_source"]]},
+                batched=True,
+                desc="dataset_source casing to "
+            )
+        
+        sorted_names = [name.lower() for name, _ in sorted(SOURCE_MAP.items(), key=lambda x: x[1])]
+        
+        source_feature = ClassLabel(names=sorted_names)
+        dataset = dataset.cast_column("dataset_source", source_feature)
+        
+        print(f"Mapowanie klas : {dataset.features['dataset_source']._str2int}")
+        
+        ####
         Data =  dataset.shuffle(seed=self.random_state)
         
         #Split it into train and subset
-        split_dataset = Data.train_test_split(test_size= (1 -self.train_split) , seed=self.random_state)
+        split_dataset = Data.train_test_split(test_size= (1 -self.train_split) , seed=self.random_state, stratify_by_column="dataset_source")
         
         train_subset = split_dataset['train']
         subset = split_dataset['test']
@@ -110,11 +173,12 @@ class Custom_DataSet_Manager():
         #Split the subset into the val and test 
         test_fraction = self.val_split / ((self.val_split + self.test_split))
         
-        split_dataset_1 = subset.train_test_split(test_size= test_fraction , seed=self.random_state)
+        split_dataset_1 = subset.train_test_split(test_size= test_fraction , seed=self.random_state, stratify_by_column="dataset_source")
         
         val_subset = split_dataset_1['train']
         test_subset = split_dataset_1['test']
-
+        
+        
         return train_subset, val_subset, test_subset
         
 
