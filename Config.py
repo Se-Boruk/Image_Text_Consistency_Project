@@ -6,11 +6,11 @@ import os
 DATABASE_RAW_PATH = os.path.join("Database", "raw")
 DATABASE_PATH = os.path.join("Database", "processed")
 
-RANDOM_STATE = 111
+RANDOM_STATE = 243
 
-TRAIN_SPLIT = 0.7
+TRAIN_SPLIT = 0.75
 VAL_SPLIT = 0.15
-TEST_SPLIT = 0.15
+TEST_SPLIT = 0.1
 
 DEFAULT_IMG_SIZE = 224
 
@@ -30,14 +30,31 @@ SPLIT_HASHES = {
 #Training hyperparams
 ########################################################
 
-EPOCHS = 2
-BATCH_SIZE = 32
-TOKEN_LENGTH = 128
-
-
+#0 order parameters
+EPOCHS = 100
+BATCH_SIZE = 64
 N_WORKERS = 5
 MAX_QUEUE = 10
-TRAIN_SET_FRACTION = 1
+
+
+#1st order parameters
+LR = 1e-4               #Learning rate... no need to explain
+BASE_FILTERS_CNN = 64   #Base n of filters for the network CNN
+HIDDEN_DIM_LSTM = 512   #Hidden dim of lstm
+VOCAB_SIZE = 9252       #Size of the vocabulary
+TOKEN_DIM = 256         #Length of the token encoding (single token length after processing)
+LATENT_SPACE = 512      #Length of vector models are producing
+SEQUENCE_LENGTH = 128   #Numbers of tokens coming into the text encoder
+
+LSTM_DEPTH = 3
+
+TRAIN_SET_FRACTION = 1   #Fraction of the train set which wll be used in the epoch
+LOSS_MARGIN = 0.7           #How far the negatives should be pushed
+PATIENCE = 5
+
+
+
+
 
 
 

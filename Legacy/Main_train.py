@@ -131,7 +131,7 @@ val_loader = Async_DataLoader(dataset = Val_set,
                                 num_workers=N_WORKERS,
                                 device='cuda',
                                 max_queue=MAX_QUEUE,
-                                image_augmentation = False,
+                                image_augmentation = True,
                                 fraction = 1
                                 )
 
@@ -150,10 +150,9 @@ text_model = Arch.Text_encoder(vocab_size = VOCAB_SIZE,
                                depth = LSTM_DEPTH
                                )
 
-image_model = Arch.Image_encoder(
-    embed_dim = LATENT_SPACE,
-    weights_path = "Models/Pretrained/resnet50_weights.pth" # Ścieżka do pliku .pth
-)
+image_model = Arch.Image_encoder(embed_dim = LATENT_SPACE
+                                 )
+
 
         
 model = Arch.Siamese_model(Image_model = image_model,
@@ -162,31 +161,20 @@ model = Arch.Siamese_model(Image_model = image_model,
                            )
 
 
-# --- LOGIKA TRANSFER LEARNINGU (MROŻENIE) ---
-# Na start mrozimy backbone ResNetu, by nie psuć wag na początku
-for param in model.img_enc.backbone.parameters():
-    param.requires_grad = False
-print("Backbone frozen for initial warm-up (Head-only training).")
-
-
+optimizer = optim.AdamW(model.parameters(),
+                        lr=LR,
+                        betas=(0.9, 0.98),
+                        weight_decay=0.01,     
+                        eps=1e-8
+                    )
 
 
 criterion = functions.Custom_loss(margin = LOSS_MARGIN,
                                   triplet_weight=1.0, 
                                   contrastive_weight=2.0,
-                                  init_temp=0.07
+                                  temp=0.07
                                   )
 
-params_to_optimize = list(model.parameters()) + list(criterion.parameters())
-
-
-# Optimizer (AdamW jest świetny dla Fine-tuningu)
-optimizer = optim.AdamW(params_to_optimize,
-                        lr=LR,
-                        betas=(0.9, 0.98),
-                        weight_decay=0.05, # Zwiększony weight decay dla stabilności ResNetu    
-                        eps=1e-8
-                    )
 
 ###################################################################
 # ( 5.5 ) Showing the models architecture and size
@@ -218,7 +206,7 @@ print(summary(model.txt_enc,
 
 
 
-UNFREEZE_EPOCH = 6
+
 
 # --- CONFIGURATION ---
 CSV_LOG_PATH = "Plots/training_log.csv"
@@ -226,7 +214,7 @@ CHECKPOINT_PATH = "Models/Trained/best_model.pth"
 CHECKPOINT_DIR = "Models/Trained/checkpoints"
 best_val_loss = float('inf')
 patience_counter = 0
-SAVE_EVERY = 2
+SAVE_EVERY = 5
 # Initialize CSV with expanded headers
 if not os.path.exists(CSV_LOG_PATH):
     with open(CSV_LOG_PATH, mode='w', newline='') as f:
@@ -238,7 +226,7 @@ if not os.path.exists(CSV_LOG_PATH):
         
 ###############
 
-accumulation_steps = 5
+accumulation_steps = 8
 import math
 steps_per_epoch = math.ceil(train_loader.get_num_batches() / accumulation_steps)
 total_updates = steps_per_epoch * EPOCHS
@@ -265,17 +253,6 @@ model.train_mode()
 print(f"Starting training on {device}!\n\n")
 
 for e in range(EPOCHS):
-    
-    # --- DYNAMICZNE ODMRAŻANIE (Curriculum Learning) ---
-    if e + 1 == UNFREEZE_EPOCH:
-        for param in model.img_enc.backbone.parameters():
-            param.requires_grad = True
-        print(f"\n>>> Epoch {e+1}: Backbone unfrozen! Starting fine-tuning of the whole model.")
-        
-        # Opcjonalnie: Możesz tu zredukować LR optymalizatora o połowę po odmrożeniu
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = param_group['lr'] * 0.5
-
     # ==========================================
     # 1. TRAINING PHASE
     # ==========================================
@@ -303,17 +280,21 @@ for e in range(EPOCHS):
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 v_main, v_aug, t_pos, t_neg = model(batch_image, batch_image_aug, batch_caption_p, batch_caption_n)
                 
-                # Zbieranie wyników do kalibracji
+                # 1. Collect scores for threshold calibration BEFORE loss scaling
+                # We use detach().cpu() to prevent memory leaks on the GPU
                 train_pos_scores.append((v_main * t_pos).sum(dim=1).detach().cpu())
                 train_neg_scores.append((v_main * t_neg).sum(dim=1).detach().cpu())
     
+                # 2. Calculate and normalize loss
                 loss = criterion(v_main, v_aug, t_pos, t_neg) / accumulation_steps
     
+            # 3. Backward pass (scaled)
             scaler.scale(loss).backward()
             c += 1
             
             is_last_batch = (pbar.n + 1 == num_train_batches)
             
+            # 4. Optimizer Step (Every N batches)
             if (c % accumulation_steps == 0) or is_last_batch:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -322,18 +303,25 @@ for e in range(EPOCHS):
                 scaler.update()
                 optimizer.zero_grad()
                 
+                # SAFETY: Prevent scheduler from stepping past total_steps
                 if scheduler.last_epoch < scheduler.total_steps:
                     scheduler.step()
-                c = 0 
+                    
+                c = 0 # Reset counter
     
+            # 5. Metrics logging
+            # Multiply by accumulation_steps for the "real" loss to show in tqdm
             current_loss = loss.item() * accumulation_steps
             train_epoch_loss += current_loss
             pbar.update(1)
             pbar.set_postfix({"loss": f"{current_loss:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
 
-    # Konwersja wyników treningowych do metryk (bez kalibracji tutaj)
+
+    # Calibrate threshold and calculate Train Metrics
     train_pos_scores = torch.cat(train_pos_scores).numpy()
     train_neg_scores = torch.cat(train_neg_scores).numpy()
+    
+
     avg_train_loss = train_epoch_loss / num_train_batches
 
     # ==========================================
@@ -343,7 +331,6 @@ for e in range(EPOCHS):
     model.eval_mode()
     val_loader.start_epoch(shuffle=False)
     
-    
     val_epoch_loss = 0.0
     val_pos_scores = []
     val_neg_scores = []
@@ -351,36 +338,33 @@ for e in range(EPOCHS):
     
     with torch.no_grad():
         with tqdm(total=num_val_batches, desc=f"Epoch {e+1} [Val]", unit=" batch") as pbar_val:
+            batch_idx = 0
             while True:
                 batch = val_loader.get_batch()
                 if batch is None: break
-            
-                img_original = batch['image_original']
                 
-                # JEŚLI brak augmentacji, użyj oryginału jako "augmentacji"
-                # To bezpieczne i poprawne dla liczenia lossa w walidacji
-                img_augmented = batch.get('image_augmented', img_original)
-    
+                img = batch['image_original']
+                aug = batch['image_augmented']
+                pos = batch['caption_positive']
+                neg = batch['caption_negative']
+                
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    # Podajemy img_original w obu miejscach
-                    v_m, v_a, t_p, t_n = model(img_original, img_augmented, 
-                                               batch['caption_positive'], batch['caption_negative'])
-                    
+                    v_m, v_a, t_p, t_n = model(img, aug, pos, neg)
                     loss = criterion(v_m, v_a, t_p, t_n)
                     
                     val_pos_scores.append((v_m * t_p).sum(dim=1).cpu())
                     val_neg_scores.append((v_m * t_n).sum(dim=1).cpu())
 
                 val_epoch_loss += loss.item()
+                batch_idx += 1
                 pbar_val.update(1)
+                pbar_val.set_postfix({"avg_val_loss": f"{val_epoch_loss / batch_idx:.4f}"})
 
     val_pos_scores = torch.cat(val_pos_scores).numpy()
     val_neg_scores = torch.cat(val_neg_scores).numpy()
     
-    # --- KLUCZOWA ZMIANA: Kalibracja na VAL ---
     current_threshold = functions.calibrate_threshold(val_pos_scores, val_neg_scores)
     
-    # Przeliczamy metryki używając progu z Walidacji dla obu zbiorów
     t_b_acc, t_recall, t_spec = functions.calculate_metrics(train_pos_scores, train_neg_scores, current_threshold)
     v_b_acc, v_recall, v_spec = functions.calculate_metrics(val_pos_scores, val_neg_scores, current_threshold)
     
@@ -428,7 +412,7 @@ for e in range(EPOCHS):
 
     # Condition B: Periodic Save (Save every N epochs)
     if (e + 1) % SAVE_EVERY == 0:
-        periodic_name = f"{CHECKPOINT_DIR}/checkpoint_epoch_{e+1}.pth"
+        periodic_name = f"{CHECKPOINT_DIR}checkpoint_epoch_{e+1}.pth"
         print(f"Periodic Save: Saving checkpoint to {periodic_name}")
         torch.save(checkpoint_data, periodic_name)
 

@@ -32,10 +32,30 @@ Calosc zostala zapisana w formacie arrow. Baza danych zawiera szczegolowy opis o
 
 
 
+#Prepared codes:
+#############################################
+#Tokenizer_lib   	X
+#Analyze_logs    	X
+#Database_functions 	Half
+#Architectures		X
+#Config			Adjust the hashes or just leave them
+#Evaluate test		Not done
+#Main_train		Half - main train loop to adjust
+#Functions		To adjust
+#Database_create_v3	To adjust ALL
 
 
+Submission 1: 
+PRóba 1
 
+Submission 2:
+Dałem po prostu zwykły model który był z epoki 25 a nie best (52)
 
+Submission 3:
+Zmiany:
+-lematyzacja tekstu
+- zwiększony sequence length do 128, i min frequency do 2 (po lematyzacji jest nawet mniejszy słownik)
+- Zmniejszony nacisk na visual img loss, mniejsza augmentacja i mniejsza waga straty
 
 
 

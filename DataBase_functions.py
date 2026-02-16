@@ -12,24 +12,177 @@ from PIL import Image as PILImage
 from collections import Counter
 from datasets import ClassLabel
 import hashlib
-
-
+import torch
+import time
+import random
+from transformers import AutoTokenizer
+import math
+import re
+import random
+import torch
+import time
+import json
+import Tokenizer_lib as Tok_lib
 from Config import SOURCE_MAP
+from Negative_map import NUMBERS_DICT, CATEGORY_POOLS, STRICT_PAIRS, SHARED_RELATIONS, SHARED_DEFINITIONS
+
+
+# =========================================================
+# INITIALIZATION (Budowanie Indeksów - Uruchamiane raz)
+# =========================================================
+
+# 1. Reverse Map dla Shared Groups: "man" -> "MALE_HUMAN"
+WORD_TO_SHARED_GROUP = {}
+for group_name, words in SHARED_DEFINITIONS.items():
+    for w in words:
+        WORD_TO_SHARED_GROUP[w] = group_name
+
+# 2. Reverse Map dla Pools: "red" -> "COLORS"
+WORD_TO_POOL_ID = {}
+for pool_name, words in CATEGORY_POOLS.items():
+    for w in words:
+        WORD_TO_POOL_ID[w] = pool_name
+
+# 3. Reverse Number Map
+NUMBERS_REVERSE = {v: k for k, v in NUMBERS_DICT.items()}
+
+# =========================================================
+# 1. LOAD LEMMA MAP (Globalnie)
+# =========================================================
+LEMMA_MAP = {}
+try:
+    with open("lemma_map.json", 'r', encoding='utf-8') as f:
+        LEMMA_MAP = json.load(f)
+    print(f"Loaded Lemma Map: {len(LEMMA_MAP)} entries.")
+except FileNotFoundError:
+    print("Warning: lemma_map.json not found! Hard negative generation will be less effective.")
+
+# =========================================================
+# 2. BUILD REVERSE INDEXES (Dla Configu)
+# =========================================================
+# Reverse Map dla Shared Groups: "man" -> "MALE_HUMAN"
+WORD_TO_SHARED_GROUP = {}
+for group_name, words in SHARED_DEFINITIONS.items():
+    for w in words:
+        WORD_TO_SHARED_GROUP[w] = group_name
+
+# Reverse Map dla Pools: "red" -> "COLORS"
+WORD_TO_POOL_ID = {}
+for pool_name, words in CATEGORY_POOLS.items():
+    for w in words:
+        WORD_TO_POOL_ID[w] = pool_name
+
+# Reverse Number Map
+NUMBERS_REVERSE = {v: k for k, v in NUMBERS_DICT.items()}
+
+
+#SWAP OF NONE NEGATIVES
+ALL_VALID_CONCEPTS = []
+for pool in CATEGORY_POOLS.values():
+    ALL_VALID_CONCEPTS.extend(pool)
+for group in SHARED_DEFINITIONS.values():
+    ALL_VALID_CONCEPTS.extend(group)
+# Usunięcie duplikatów dla czystości puli
+ALL_VALID_CONCEPTS = list(set(ALL_VALID_CONCEPTS))
 
 
 
+def create_slightly_negative_caption(caption):
+    """
+    Tworzy Hard Negative w oparciu o LEMATYZACJĘ OFFLINE.
+    Z dodanym mechanizmem 'Silly Fallback' na wypadek braku trafień w słownikach.
+    """
+    if not caption: return None, False
 
-class DummyTokenizer:
-    def __init__(self, max_length=128):
-        self.max_length = max_length
+    raw_tokens = Tok_lib.preprocess_text(caption)
+    if not raw_tokens: return None, False
 
-    def __call__(self, caption):
-        """
-        Converts a list of strings into a LongTensor of ASCII values.
-        """
-        tokens = torch.zeros((self.max_length), dtype=torch.long)
+    # 1. Kandydaci (Index, Strategia, Meta=Lemma)
+    candidates = [] 
+    
+    for i, token in enumerate(raw_tokens):
+        token_lower = token.lower()
+        lemma = LEMMA_MAP.get(token_lower, token_lower)
+
+        if len(lemma) < 2 and not lemma.isdigit():
+            continue
+
+        if lemma in NUMBERS_DICT or lemma.isdigit():
+            candidates.append((i, "NUMBER", lemma))
+        elif lemma in WORD_TO_SHARED_GROUP:
+            source_group = WORD_TO_SHARED_GROUP[lemma]
+            if source_group in SHARED_RELATIONS:
+                candidates.append((i, "SHARED", source_group))
+        elif lemma in STRICT_PAIRS:
+            candidates.append((i, "STRICT", lemma))
+        elif lemma in WORD_TO_POOL_ID:
+            candidates.append((i, "POOL", lemma))
+
+    final_tokens = list(raw_tokens) 
+    swaps_performed = 0
+
+    # --- LOGIKA GŁÓWNA ---
+    if candidates:
+        desired_swaps = random.choices([1, 2, 3], weights=[0.50, 0.4, 0.1], k=1)[0]
+        num_swaps = min(desired_swaps, len(candidates))
+        random.shuffle(candidates)
+        targets = candidates[:num_swaps]
+
+        for target_idx, strategy, meta in targets:
+            new_word_lemma = None
+
+            if strategy == "NUMBER":
+                val = int(meta) if meta.isdigit() else NUMBERS_DICT.get(meta, 1)
+                offset = random.choice([-1, 1, 2])
+                new_val = max(1, val + offset)
+                if new_val == val: new_val += 1
+                new_word_lemma = str(new_val) if meta.isdigit() else NUMBERS_REVERSE.get(new_val, str(new_val))
+
+            elif strategy == "SHARED":
+                target_group_name = SHARED_RELATIONS[meta]
+                # Guardrail przed KeyError wspomniany wcześniej
+                if target_group_name in SHARED_DEFINITIONS:
+                    new_word_lemma = random.choice(SHARED_DEFINITIONS[target_group_name])
+
+            elif strategy == "STRICT":
+                new_word_lemma = random.choice(STRICT_PAIRS[meta])
+
+            elif strategy == "POOL":
+                pool_id = WORD_TO_POOL_ID[meta]
+                valid_options = [w for w in CATEGORY_POOLS[pool_id] if w != meta]
+                if valid_options:
+                    new_word_lemma = random.choice(valid_options)
+
+            if new_word_lemma:
+                final_tokens[target_idx] = new_word_lemma
+                swaps_performed += 1
+
+    # =========================================================
+    # SILLY FALLBACK (Jeśli słowniki zawiodły)
+    # =========================================================
+    if swaps_performed == 0:
+        # Wybieramy indeksy słów, które mają sens semantyczny (dłuższe niż 2 znaki)
+        possible_indices = [idx for idx, t in enumerate(raw_tokens) if len(t) > 2]
         
-        return tokens
+        if not possible_indices:
+            possible_indices = list(range(len(raw_tokens)))
+    
+        target_idx = random.choice(possible_indices)
+        original_word = final_tokens[target_idx].lower()
+        
+        # Wybieramy słowo z puli ALL_VALID_CONCEPTS, omijając oryginał
+        # To zapewnia, że negatyw zawsze dotyczy obiektu z domeny (np. car, dog, pizza)
+        valid_fallback_options = [w for w in ALL_VALID_CONCEPTS if w != original_word]
+        
+        if valid_fallback_options:
+            final_tokens[target_idx] = random.choice(valid_fallback_options)
+            swaps_performed += 1
+
+    return " ".join(final_tokens), True
+
+
+
+
 
 
 
@@ -78,7 +231,7 @@ def verify_dataset_integrity(train_ds, val_ds, test_ds, expected_hashes=None):
 
 
 
-def preprocess_image_to_square(img_input, target_size=256):
+def preprocess_image_to_square(img_input, target_size=224):
     """
     Universal preprocessor for PIL, NumPy, or Torch inputs.
     Resizes maintaining aspect ratio and pads to a square.
@@ -187,7 +340,7 @@ class Custom_DataSet_Manager():
     
     
 class Async_DataLoader():
-    def __init__(self, dataset, batch_size=32,token_length = 128, num_workers=2, device='cuda', max_queue=10, add_augmented = True, fraction = None):
+    def __init__(self, dataset, batch_size=32, sequence_length = 128, num_workers=2, device='cuda', max_queue=10, image_augmentation = True , fraction = None):
         self.dataset = dataset
         #Taking sample of from dataset to initialize the shape of images
         sample_img = np.array(dataset[0]["image"], dtype=np.uint8)
@@ -209,14 +362,19 @@ class Async_DataLoader():
         self.indices = list(range(len(self.dataset)))
         
 
-        self.token_length = token_length
+        self.sequence_length = sequence_length
         #Preallocate pinned buffers
         self.pinned_bufs = [torch.empty((self.batch_size, self.C, self.H, self.W), 
                                         dtype=torch.float32).pin_memory() 
                             for _ in range(num_workers)]
         
-        self.caption_bufs = [torch.empty((self.batch_size,self.token_length), 
-                                        dtype=torch.float32).pin_memory() 
+        self.positive_caption_bufs = [torch.empty((self.batch_size,self.sequence_length), 
+                                        dtype=torch.long).pin_memory() 
+                            for _ in range(num_workers)]
+        
+
+        self.negative_caption_bufs = [torch.empty((self.batch_size,self.sequence_length), 
+                                        dtype=torch.long).pin_memory() 
                             for _ in range(num_workers)]
         
         
@@ -224,16 +382,146 @@ class Async_DataLoader():
                                         dtype=torch.float32).pin_memory() 
                             for _ in range(num_workers)]
         
-        self.add_augmented = add_augmented
+        self.image_augmentation = image_augmentation
+
         
-        self.tokenizers = [DummyTokenizer(self.token_length) for _ in range(self.num_workers)]
+
         
+        self.tokenizers = [Tok_lib.SimpleTokenizer("vocab.json", "lemma_map.json", self.sequence_length) for _ in range(self.num_workers)]
+        self.aug_counter = 0
         
         # threads will be started lazily in start_epoch (safer on Windows/spawn)
         self.threads_started = False
         
         # do not start prefetch here
         # self._start_prefetch()
+
+    def _augment_images(self, image_batch, flip_allowed=None,
+                        brightness=0.2, contrast=0.2, saturation=0.2,
+                        flip_prob=0.5, max_rot=15, crop_ratio=0.85, 
+                        p_spatial=0.8, p_color=0.8, p_gray=0.15):
+        """
+        Zoptymalizowana augmentacja z flagami per-obrazek (flip_allowed).
+        
+        Args:
+            image_batch (Tensor): [B, C, H, W] - batch obrazów (0-1).
+            flip_allowed (Tensor Bool): [B] - maska określająca czy dany obrazek MOŻE być odbity.
+                                      Jeśli None, wszystkie mogą być odbite.
+        """
+        B, C, H, W = image_batch.shape
+        device = image_batch.device
+        dtype = image_batch.dtype
+        
+        # Klonowanie, aby nie modyfikować oryginału w pamięci pinned
+        image_batch = image_batch.clone()
+
+        # Domyślnie pozwalamy na flip wszystkim, jeśli nie podano flag
+        if flip_allowed is None:
+            flip_allowed = torch.ones(B, dtype=torch.bool, device=device)
+
+        # ==================================================================
+        # 1. TRANSFORMACJE PRZESTRZENNE (Single-Pass Affine)
+        # ==================================================================
+        # Losujemy, które obrazki w ogóle podlegają transformacji przestrzennej
+        spatial_mask = torch.rand(B, device=device) < p_spatial
+        
+        if spatial_mask.any():
+            # Liczba obrazków do przetworzenia
+            B_sub = spatial_mask.sum().item()
+            
+            # Wyciągamy flagi flipa TYLKO dla przetwarzanych obrazków
+            # To krytyczne: mapujemy [B] -> [B_sub]
+            flip_allowed_sub = flip_allowed[spatial_mask]
+
+            # --- A. Parametry losowe dla każdego obrazka ---
+            
+            # Rotacja (w radianach)
+            angles = (torch.rand(B_sub, device=device) * 2 - 1) * max_rot
+            radians = angles * (3.14159265 / 180)
+            
+            # Skalowanie (Zoom in)
+            # Randomizacja zoomu: od crop_ratio do 1.0
+            curr_crop = crop_ratio + (torch.rand(B_sub, device=device) * (1.0 - crop_ratio))
+            scale = 1.0 / curr_crop
+            
+            # Przesunięcie (Shift)
+            # Maksymalne przesunięcie zależy od tego, jak mocno przybliżyliśmy
+            max_shift = 1.0 - curr_crop
+            tx = (torch.rand(B_sub, device=device) * 2 - 1) * max_shift
+            ty = (torch.rand(B_sub, device=device) * 2 - 1) * max_shift
+
+            # --- B. Logika Inteligentnego Flipa ---
+            
+            # 1. "Chęć" flipa (losowa szansa)
+            wants_flip = torch.rand(B_sub, device=device) < flip_prob
+            
+            # 2. Ostateczna decyzja (AND logiczny): Chce flipa ORAZ ma pozwolenie
+            actual_flip_mask = wants_flip & flip_allowed_sub
+            
+            # 3. Tworzymy wektor mnożnika: 1.0 (brak flipa) lub -1.0 (flip)
+            flip_factor = torch.ones(B_sub, device=device)
+            flip_factor[actual_flip_mask] = -1.0
+            
+            # --- C. Konstrukcja Macierzy Afinicznej ---
+            
+            cos = torch.cos(radians) * scale
+            sin = torch.sin(radians) * scale
+            
+            affine_mats = torch.zeros(B_sub, 2, 3, device=device, dtype=dtype)
+            
+            # Oś X (mnożymy przez flip_factor, aby uzyskać odbicie lustrzane)
+            affine_mats[:, 0, 0] = cos * flip_factor 
+            affine_mats[:, 0, 1] = -sin
+            affine_mats[:, 0, 2] = tx
+            
+            # Oś Y
+            affine_mats[:, 1, 0] = sin * flip_factor # Rotacja musi uwzględniać zmianę układu
+            affine_mats[:, 1, 1] = cos
+            affine_mats[:, 1, 2] = ty
+
+            # --- D. Aplikacja (Grid Sample) ---
+            grid = F.affine_grid(affine_mats, [B_sub, C, H, W], align_corners=False)
+            
+            # Używamy trybu 'reflection', żeby nie było czarnych ramek przy obrocie
+            image_batch[spatial_mask] = F.grid_sample(
+                image_batch[spatial_mask], grid, 
+                mode='bicubic', padding_mode='reflection', align_corners=False
+            )
+
+        # ==================================================================
+        # 2. GRAYSCALE (Wymuszanie semantyki kształtu)
+        # ==================================================================
+        if C == 3:
+            gray_mask = torch.rand(B, 1, 1, 1, device=device) < p_gray
+            if gray_mask.any():
+                # ITU-R 601-2 luma transform
+                luma = (image_batch[:, 0:1] * 0.299 + 
+                        image_batch[:, 1:2] * 0.587 + 
+                        image_batch[:, 2:3] * 0.114)
+                # Powielamy kanał 3 razy, żeby zachować wymiar [B, 3, H, W]
+                image_batch = torch.where(gray_mask, luma.repeat(1, 3, 1, 1), image_batch)
+
+        # ==================================================================
+        # 3. COLOR JITTERING (Jasność, Kontrast, Nasycenie)
+        # ==================================================================
+        color_mask = torch.rand(B, 1, 1, 1, device=device) < p_color
+        if color_mask.any():
+            # Brightness
+            b_factors = 1.0 + (torch.rand(B, 1, 1, 1, device=device) * 2 - 1) * brightness
+            image_batch = torch.where(color_mask, image_batch * b_factors, image_batch)
+
+            # Contrast
+            mean = image_batch.mean(dim=[2, 3], keepdim=True)
+            c_factors = 1.0 + (torch.rand(B, 1, 1, 1, device=device) * 2 - 1) * contrast
+            image_batch = torch.where(color_mask, (image_batch - mean) * c_factors + mean, image_batch)
+
+            # Saturation (Tylko RGB)
+            if C == 3:
+                gray = image_batch.mean(dim=1, keepdim=True)
+                s_factors = 1.0 + (torch.rand(B, 1, 1, 1, device=device) * 2 - 1) * saturation
+                image_batch = torch.where(color_mask, (image_batch - gray) * s_factors + gray, image_batch)
+
+        return image_batch.clamp(0, 1)
 
     def _start_prefetch(self):
         
@@ -250,51 +538,92 @@ class Async_DataLoader():
 
         def worker(worker_id):
             pinned_buf = self.pinned_bufs[worker_id]
-            caption_bufs = self.caption_bufs[worker_id]
+            positive_caption_bufs = self.positive_caption_bufs[worker_id]
+            negative_caption_bufs = self.negative_caption_bufs[worker_id]
             origin_bufs = self.origin_bufs[worker_id]
-            
             Tokenizer = self.tokenizers[worker_id]
         
             while True:
-                self.epoch_event.wait()  # wait for epoch start
-        
+                self.epoch_event.wait()
+                
+                FORBIDDEN_FLIP_WORDS = {"left", "right", "port", "starboard", "east", "west"}
                 while True:
                     start, end = get_chunk()
                     if start is None:
                         break
                     actual_bs = end - start
+                    
+                    flip_flags = []
         
-                    # ---------------------------
-                    # Load original batch into pinned memory
-                    # ---------------------------
                     for i in range(actual_bs):
                         idx = self.indices[start + i]
                         
+                        # [Image Loading Logic ...] 
                         img = np.array(self.dataset[idx]["image"], dtype=np.float32) / 255.0
                         
-                        caption = self.dataset[idx]['caption']
-                        caption = Tokenizer(caption)
+                        # 2. DODAJ TO: Normalizacja ImageNet
+                        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+                        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+                        
+                        # Operacja na tablicy numpy: (Obraz - Średnia) / Odchylenie
+                        img = (img - mean) / std
 
-                        origin = self.dataset[idx]['dataset_source']
-                        
-                        if origin == "coco":
-                            origin = 0
-                        elif origin == "ade20k":
-                            origin = 1
-                        elif origin == "flick30k":
-                            origin = 2
+                        # [Caption Selection Logic ...]
+                        if random.random() > 0.8:
+                            caption_positive = self.dataset[idx]['caption']
                         else:
-                            origin = 3
+                            indexes = [0, 1, 2, 3]
+                            selected = random.sample(indexes, 2)
+                            caption_positive = self.dataset[idx]['caption_aug'][selected[0]]
+
+                        # FLIP MAP CREATION
+                        if caption_positive:
+                            # 1. Pobierz listę tokenów
+                            tokens_list = Tok_lib.preprocess_text(caption_positive)
+                            
+                            # 2. Zamień na set, aby użyć intersection (i przyspieszyć wyszukiwanie)
+                            cap_words = set(tokens_list)
+                            
+                            # 3. Sprawdź część wspólną
+                            # Jeśli intersection nie jest puste -> len > 0 -> can_flip = False
+                            can_flip = len(cap_words.intersection(FORBIDDEN_FLIP_WORDS)) == 0
+                        else:
+                            can_flip = True
                         
-                        ######
+                        flip_flags.append(can_flip)
+
+
+                        # --- NEGATIVE SELECTION 
+                        caption_negative, _ = create_slightly_negative_caption(caption_positive)
+                        #caption_negative, succes = create_slightly_negative_caption(caption_positive)
+                        #if not succes:
+                            #print("Positive:", caption_positive)
+                            #print("Negative:", caption_negative)
+                            #print("="*40)
+                        
+                        # [Encoding Logic ...]
+                        caption_negative = Tokenizer.encode(caption_negative)
+                        caption_negative = torch.tensor(caption_negative, dtype=torch.long)
+                        caption_positive = Tokenizer.encode(caption_positive)
+                        caption_positive = torch.tensor(caption_positive, dtype=torch.long)
+                        
+                        # [Origin Logic ...]
+                        origin = self.dataset[idx]['dataset_source']
+                        origin_map = {"mscoco_train2017": 0, "ade20k": 1, "flick30k": 2}
+                        origin_val = origin_map.get(origin, 3) # Safe get
+
+                        # [Buffer Copying ...]
                         pinned_buf[i].copy_(torch.from_numpy(img).permute(2, 0, 1))
-                        caption_bufs[i].copy_(caption)
-                        origin_bufs[i].fill_(origin)
+                        positive_caption_bufs[i].copy_(caption_positive)
+                        negative_caption_bufs[i].copy_(caption_negative)
+                        origin_bufs[i].fill_(origin_val)
         
                     # Clone to avoid modifying pinned memory
                     origin_batch = origin_bufs[:actual_bs].to(self.device, non_blocking=True).clone()
                     original_batch = pinned_buf[:actual_bs].to(self.device, non_blocking=True).clone()
-                    original_captions = caption_bufs[:actual_bs].to(self.device, non_blocking=True).clone()
+                    
+                    positive_caption_batch = positive_caption_bufs[:actual_bs].to(self.device, non_blocking=True).clone()           
+                    negative_caption_batch = negative_caption_bufs[:actual_bs].to(self.device, non_blocking=True).clone()
                     
         
                     # ---------------------------
@@ -303,19 +632,17 @@ class Async_DataLoader():
                     batch_dict = {
                         'origin': origin_batch,
                         "image_original": original_batch,
-                        "caption_positive": original_captions
+                        "caption_positive": positive_caption_batch,
+                        "caption_negative": negative_caption_batch
                     }
-        
+                    
                     # Augmented
-                    if self.add_augmented:
-                        aug_images = augment_images(original_batch)
+                    if self.image_augmentation:
+                        flip_tensor = torch.tensor(flip_flags, device=self.device, dtype=torch.bool)
+                        aug_images = self._augment_images(original_batch, flip_tensor)
                         batch_dict["image_augmented"] = aug_images
-                    
-                    #Prepare the negative caption as well - currently just the placeholder
-                    ###################################
-                    batch_dict["caption_negeative"] = original_captions
-                    ###################################
-                    
+                        
+
                     # Push to queue
                     self.queue.put(batch_dict)
         
@@ -424,89 +751,5 @@ class Async_DataLoader():
     
 ##########################################################################
 
-
-def augment_images(image_batch,
-                    brightness=0.2, contrast=0.2, saturation=0.2,
-                    flip_prob=0.5, max_rot=15, crop_ratio=0.9):
-    
-    """
-    image_batch: (B, C, H, W) tensor, float in [0,1]
-    Returns: augmented_image_batch, (in [0,1])
-    """
-    B, C, H, W = image_batch.shape
-    device = image_batch.device
-    dtype = image_batch.dtype
-
-
-    # clone to avoid in-place modifications
-    image_batch = image_batch.clone()
-
-    # -----------------------------
-    # 1. Random horizontal flip
-    # -----------------------------
-    flip_mask = torch.rand(B, device=device) < flip_prob
-    if flip_mask.any():
-        image_batch[flip_mask] = image_batch[flip_mask].flip(dims=[-1])
-
-
-    # -----------------------------
-    # 2. Random rotation
-    # -----------------------------
-    angles = (torch.rand(B, device=device) * 2 - 1) * max_rot  # -max_rot .. +max_rot
-    radians = angles * (3.14159265 / 180)
-
-    cos = torch.cos(radians)
-    sin = torch.sin(radians)
-    rot_matrices = torch.zeros(B, 2, 3, device=device, dtype=dtype)
-    rot_matrices[:, 0, 0] = cos
-    rot_matrices[:, 0, 1] = -sin
-    rot_matrices[:, 1, 0] = sin
-    rot_matrices[:, 1, 1] = cos
-    rot_matrices[:, :, 2] = 0  # rotate around center
-
-    grid = F.affine_grid(rot_matrices, image_batch.size(), align_corners=False)
-    image_batch = F.grid_sample(image_batch, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-
-    # -----------------------------
-    # 3. Random crop + resize
-    # -----------------------------
-    if crop_ratio < 1.0:
-        crop_h = int(H * crop_ratio)
-        crop_w = int(W * crop_ratio)
-        top = torch.randint(0, H - crop_h + 1, (B,), device=device)
-        left = torch.randint(0, W - crop_w + 1, (B,), device=device)
-
-        cropped_images = torch.zeros_like(image_batch)
-
-        for i in range(B):
-            cropped_images[i] = F.interpolate(
-                image_batch[i:i+1, :, top[i]:top[i]+crop_h, left[i]:left[i]+crop_w],
-                size=(H, W), mode='bilinear', align_corners=False
-            )
-
-        image_batch = cropped_images
-
-    # -----------------------------
-    # 4. Color jitter
-    # -----------------------------
-    b_factors = 1.0 + (torch.rand(B,1,1,1, device=device, dtype=dtype) * 2 - 1) * brightness
-    image_batch = image_batch * b_factors
-
-    mean = image_batch.mean(dim=[2,3], keepdim=True)
-    c_factors = 1.0 + (torch.rand(B,1,1,1, device=device, dtype=dtype) * 2 - 1) * contrast
-    image_batch = (image_batch - mean) * c_factors + mean
-
-    if C == 3:
-        gray = image_batch.mean(dim=1, keepdim=True)
-        s_factors = 1.0 + (torch.rand(B,1,1,1, device=device, dtype=dtype) * 2 - 1) * saturation
-        image_batch = (image_batch - gray) * s_factors + gray
-
-    # -----------------------------
-    # 5. Clamp to [0,1] range
-    # -----------------------------
-    image_batch = image_batch.clamp(0, 1)
-
-
-    return image_batch
 
     

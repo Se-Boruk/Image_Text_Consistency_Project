@@ -29,7 +29,7 @@ JSON_PATHS = {
     "flick30k": os.path.join(DATABASE_RAW_PATH, "flickr30k_train_captions.jsonl"),
     "ade20k": os.path.join(DATABASE_RAW_PATH, "ade20k_train_captions.jsonl"),
 }
-N_WORKERS = 5
+N_WORKERS = 1
 TMP_CACHE_DIR =  os.path.join(DATABASE_RAW_PATH, "temp_cache")
 DATABASES = ["flick30k", "ade20k", "coco"]
 
@@ -74,6 +74,8 @@ def prepare_worker_data(input_jsonl):
                     "caption": item['caption'], 
                     "source": item['dataset_id']
                 })
+                
+        print("DONE!")
     return filtered_data
 
 def shard_generator(full_list):

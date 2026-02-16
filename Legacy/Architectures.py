@@ -1,57 +1,126 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models
-import os
+
+
 
 
 
 class Image_encoder(nn.Module):
-    def __init__(self, embed_dim, weights_path="Models/Pretrained/resnet50_weights.pth"):
+    """
+    Image encoder for extraction of feature vector from image to compare 
+    it with the feature vector from the text.
+    
+    It uses the few main modules:
+        1)
+        InvertedResidual: 
+        Its conv block from Mobilenet 2 which uses the depthwise conv.
+        This is block of given length and between each smaller block tehre is skip connection.
+        
+        2)
+        Transition block:
+        It is just downsample block. it is added for simplicity and compatibility of the Inverted blocks
+        #In this block we are changing n of filters and thanks to that the residual block can 
+        operate on single filter number and be simplier
+        
+        3)
+    
+        Initial and end conv layers followed by the dense layer
+
+    """
+
+    
+    class InvertedResidual(nn.Module):
+        """
+        1x1 Expansion -> 3x3 Depthwise -> 1x1 Projection.
+        """
+        def __init__(self, channels, depth, expansion=4, dropout_rate=0.1):
+            super().__init__()
+            hidden_dim = channels * expansion
+            self.layers = nn.ModuleList()
+            
+            for _ in range(depth):
+                self.layers.append(nn.Sequential(
+                    #1 Conv + Expansion
+                    nn.Conv2d(channels, hidden_dim, 1, bias=False),
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.LeakyReLU(0.02, inplace=True),
+                    
+                    #2 Depthwise
+                    nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim, bias=False),
+                    nn.BatchNorm2d(hidden_dim),
+                    nn.LeakyReLU(0.02, inplace=True),
+                    
+                    #3 Conv + collapse
+                    nn.Conv2d(hidden_dim, channels, 1, bias=False),
+                    nn.BatchNorm2d(channels),
+                    nn.Dropout2d(dropout_rate)
+                ))
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = x + layer(x) #Skipp connection between tha smaleler blocks 
+            return x
+
+    class TransitionBlock(nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.LeakyReLU(0.02, inplace=True)
+            )
+
+        def forward(self, x):
+            return self.downsample(x)
+
+
+    #Start of the init of the network
+    def __init__(self, embed_dim, base_filter=32):
         super().__init__()
         
-        # 1. Init ResNet50
-        self.backbone = models.resnet50(weights=None)
-        
-        if os.path.exists(weights_path):
-            state_dict = torch.load(weights_path, map_location='cpu', weights_only=True)
-            self.backbone.load_state_dict(state_dict)
-            print(f"Loaded ResNet50 backbone (Offline)")
-
-        num_features = self.backbone.fc.in_features 
-        self.backbone.fc = nn.Identity()
-
-        # 2. Head
-        self.fc = nn.Sequential(
-            nn.Linear(num_features, num_features // 2), 
-            nn.LayerNorm(num_features // 2), 
-            nn.LeakyReLU(0.02),
-            nn.Dropout(0.1),
-        
-            nn.Linear(num_features // 2, embed_dim),    
-            nn.LayerNorm(embed_dim),          
-            nn.LeakyReLU(0.02),
-        
-            nn.Linear(embed_dim, embed_dim)             
+        #Start first network. Initial fast downsample as well
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, base_filter, 5, padding=2, stride=2, bias=False), 
+            nn.BatchNorm2d(base_filter),
+            nn.LeakyReLU(0.02)
         )
-        
-    def forward(self, x):
-        x = self.backbone(x)
-        return self.fc(x)
 
-    # --- THE FIX IS HERE ---
-    def train(self, mode=True):
-        """
-        Overwrites the default train() to ensure BN layers in the backbone
-        remain in eval mode (frozen stats) even during fine-tuning.
-        """
-        super().train(mode)
+        # Config: (depth, filter_multiplier) For the residual blocks
         
-        # Force BatchNorm layers in the backbone to stay in Eval mode
-        # This prevents the "running_mean" from being corrupted by your batches
-        for module in self.backbone.modules():
-            if isinstance(module, nn.BatchNorm2d):
-                module.eval()
+        configs = [(2, 2), (4, 4), (6, 6), (6, 8), (2, 12)]
+        self.stages = nn.ModuleList()
+        curr_c = base_filter
+        
+        #Applying the depthwise network part
+        for depth, mult in configs:
+            out_c = base_filter * mult
+            self.stages.append(self.InvertedResidual(curr_c, depth))
+            self.stages.append(self.TransitionBlock(curr_c, out_c))
+            curr_c = out_c
+
+        #Creating one dim vector for the fc layers
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        
+        
+        #Fully connected layers: producing the embedded image vector
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(curr_c, embed_dim),
+            nn.BatchNorm1d(embed_dim),
+            nn.LeakyReLU(0.02),
+            nn.Dropout(0.15),
+            nn.Linear(embed_dim, embed_dim)
+        )
+
+
+    def forward(self, x):
+        x = self.stem(x)
+        for stage in self.stages:
+            x = stage(x)
+            
+        return self.fc(self.gap(x))
+
 
 
 class Text_encoder(nn.Module):
@@ -99,7 +168,7 @@ class Text_encoder(nn.Module):
         
         self.fc = nn.Sequential(
             nn.Linear(hidden_dim, embed_dim),
-            nn.LayerNorm(embed_dim),    # <--- THE FIX (Safe & Stable)
+            nn.BatchNorm1d(embed_dim),
             nn.LeakyReLU(0.02),
             nn.Linear(embed_dim, embed_dim)
         )
@@ -161,10 +230,10 @@ class Siamese_model(nn.Module):
         t_neg = self.txt_enc(neg_cap)
 
         #NORMALIZATION , specifically for the contrastive and triplet loss
-        v_main = F.normalize(v_main, p=2, dim=1, eps=1e-8) # Added eps
-        v_aug  = F.normalize(v_aug, p=2, dim=1, eps=1e-8)
-        t_pos  = F.normalize(t_pos, p=2, dim=1, eps=1e-8)
-        t_neg  = F.normalize(t_neg, p=2, dim=1, eps=1e-8)
+        v_main = F.normalize(v_main, p=2, dim=1)
+        v_aug  = F.normalize(v_aug, p=2, dim=1)
+        t_pos  = F.normalize(t_pos, p=2, dim=1)
+        t_neg  = F.normalize(t_neg, p=2, dim=1)
 
         return v_main, v_aug, t_pos, t_neg
     
@@ -187,8 +256,8 @@ class Siamese_model(nn.Module):
             
             #Normalize
             #The loss was trained on normalized vectors, so prediction must use them too
-            v_img = F.normalize(v_img, p=2, dim=1, eps=1e-8)
-            t_text = F.normalize(t_text, p=2, dim=1, eps=1e-8)
+            v_img = F.normalize(v_img, p=2, dim=1)
+            t_text = F.normalize(t_text, p=2, dim=1)
             
             #Calculate Cosine Similarity
             #Dot product of normalized vectors is Cosine Similarity
