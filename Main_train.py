@@ -238,7 +238,7 @@ if not os.path.exists(CSV_LOG_PATH):
         
 ###############
 
-accumulation_steps = 5
+accumulation_steps = 4
 import math
 steps_per_epoch = math.ceil(train_loader.get_num_batches() / accumulation_steps)
 total_updates = steps_per_epoch * EPOCHS
