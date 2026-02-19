@@ -32,7 +32,7 @@ SPLIT_HASHES = {
 
 #0 order parameters
 EPOCHS = 100
-BATCH_SIZE = 64
+BATCH_SIZE = 48
 N_WORKERS = 5
 MAX_QUEUE = 10
 
@@ -41,15 +41,15 @@ MAX_QUEUE = 10
 LR = 1e-4               #Learning rate... no need to explain
 BASE_FILTERS_CNN = 64   #Base n of filters for the network CNN
 HIDDEN_DIM_LSTM = 512   #Hidden dim of lstm
-VOCAB_SIZE = 14859       #Size of the vocabulary
+VOCAB_SIZE = 20387       #Size of the vocabulary
 TOKEN_DIM = 512         #Length of the token encoding (single token length after processing)
 LATENT_SPACE = 512      #Length of vector models are producing
-SEQUENCE_LENGTH = 96   #Numbers of tokens coming into the text encoder
+SEQUENCE_LENGTH = 224   #Numbers of tokens coming into the text encoder
 
 LSTM_DEPTH = 3
 
 TRAIN_SET_FRACTION = 1   #Fraction of the train set which wll be used in the epoch
-LOSS_MARGIN = 0.6           #How far the negatives should be pushed
+LOSS_MARGIN = 0.7           #How far the negatives should be pushed
 PATIENCE = 5
 
 

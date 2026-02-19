@@ -10,48 +10,61 @@ class Image_encoder(nn.Module):
     def __init__(self, embed_dim, weights_path="Models/Pretrained/resnet50_weights.pth"):
         super().__init__()
         
-        # 1. Init ResNet50
-        self.backbone = models.resnet50(weights=None)
+        # 1. Init ResNet50 Backbone
+        resnet = models.resnet50(weights=None)
         
         if os.path.exists(weights_path):
             state_dict = torch.load(weights_path, map_location='cpu', weights_only=True)
-            self.backbone.load_state_dict(state_dict)
+            resnet.load_state_dict(state_dict)
             print(f"Loaded ResNet50 backbone (Offline)")
 
-        num_features = self.backbone.fc.in_features 
-        self.backbone.fc = nn.Identity()
+        # Cut off the original AvgPool and FC
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        # 2. Head
+        # 2. SPATIAL NECK (The "Visual Tokenizer")
+        # We transform the 2048x7x7 output into a 512x4x4 grid.
+        self.spatial_neck = nn.Sequential(
+            # A. Compress Channels (2048 -> 512)
+            # We keep the semantic richness high to match the LSTM hidden state
+            nn.Conv2d(2048, 512, kernel_size=1), 
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1),
+            
+            # B. Force Spatial Reduction (7x7 -> 4x4)
+            # Adaptive Pooling allows this to work even if input image size changes slightly
+            nn.AdaptiveAvgPool2d((4, 4))
+        )
+        
+        # Calculation: 512 channels * 16 locations = 8192 features
+        flatten_dim = 512 * 4 * 4 
+
+        # 3. DENSE HEAD
+        # Now learns the relationship between these 16 "visual tokens"
         self.fc = nn.Sequential(
-            nn.Linear(num_features, num_features // 2), 
-            nn.LayerNorm(num_features // 2), 
+            nn.Flatten(),
+            
+            nn.Linear(flatten_dim, flatten_dim // 2), # 8192 -> 4096
+            nn.LayerNorm(flatten_dim // 2),
             nn.LeakyReLU(0.02),
             nn.Dropout(0.1),
         
-            nn.Linear(num_features // 2, embed_dim),    
-            nn.LayerNorm(embed_dim),          
-            nn.LeakyReLU(0.02),
-        
-            nn.Linear(embed_dim, embed_dim)             
+            nn.Linear(flatten_dim // 2, embed_dim),   # 4096 -> 512
+            nn.LayerNorm(embed_dim)             
         )
         
     def forward(self, x):
-        x = self.backbone(x)
-        return self.fc(x)
+        x = self.backbone(x)        # [B, 2048, 7, 7]
+        x = self.spatial_neck(x)    # [B, 512, 4, 4] -> "16 tokens of dim 512"
+        return self.fc(x)           # [B, embed_dim]
 
-    # --- THE FIX IS HERE ---
     def train(self, mode=True):
-        """
-        Overwrites the default train() to ensure BN layers in the backbone
-        remain in eval mode (frozen stats) even during fine-tuning.
-        """
         super().train(mode)
-        
-        # Force BatchNorm layers in the backbone to stay in Eval mode
-        # This prevents the "running_mean" from being corrupted by your batches
+        # Keep Backbone BatchNorm frozen
         for module in self.backbone.modules():
             if isinstance(module, nn.BatchNorm2d):
                 module.eval()
+
+
 
 
 class Text_encoder(nn.Module):

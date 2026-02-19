@@ -14,46 +14,40 @@ import Config
 # Functions directly for the Tokenizer and text processing
 #===========================================================================
 
-# ---------------------------------------------------------
-# 1. SHARED PREPROCESSING FUNCTION
-# ---------------------------------------------------------
 def preprocess_text(text):
     """
     Function takes the text in the string format and performs these operations:
     1. Undercapitalize
-    2. REMOVE NON-ASCII (Chinese, Emoji, Special Symbols)
-    3. Separate EXTENDED punctuation
-    4. Collapse repeated punctuation
-    5. Split by whitespace
+    2. Explicitly handle Newlines (Safety fix)
+    3. REMOVE NON-ASCII (Chinese, Emoji, Special Symbols)
+    4. Separate EXTENDED punctuation
+    5. Collapse repeated punctuation
+    6. Split by whitespace
     """
-    
     if not text:
         return []
 
     # 1. Undercapitalize
     text = text.lower()
     
-    # 2. REMOVE NON-ASCII (Chinese Fix)
+    # 2. SAFETY: Replace newlines with spaces
+    # This prevents "word.\nNext" from becoming "word.Next" if regex fails
+    text = text.replace('\n', ' ').replace('\r', ' ')
+    
+    # 3. REMOVE NON-ASCII
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
     
-    # 3. EXPANDED PUNCTUATION SPLITTING (Slash Fix)
+    # 4. EXPANDED PUNCTUATION SPLITTING
     text = re.sub(r'([.,!?;:()"\-+=_/—|<>@#%&*\[\]\'])', r' \1 ', text)
     
-    # 4. Collapse repeated punctuation
+    # 5. Collapse repeated punctuation
     text = re.sub(r'([.,!?;:()"\-+=_/—|<>@#%&*\[\]\'])\1+', r'\1', text)
     
-    # 5. Split
+    # 6. Split
     return text.split()
 
 
 class SimpleTokenizer:
-    """
-    Tokenizer which, well tokenizes the words into the numbers
-    
-    We can use it to encode string-sequence to the token list and vice versa
-    to decode the token list into the string sequence
-    """
-    
     def __init__(self, vocab_path, lemma_map_path=None, max_length=None):
         
         # Opening created vocab.json file
@@ -77,12 +71,10 @@ class SimpleTokenizer:
         words = preprocess_text(text)
         
         # 2. Offline Lemmatization & Expansion
-        # The map might return "dog <MULTIPLE>", so we need to handle splitting.
         expanded_tokens = []
         if self.lemma_map:
             for w in words:
                 mapped = self.lemma_map.get(w, w)
-                # Split by space just in case mapped value is "base <MULTIPLE>"
                 expanded_tokens.extend(mapped.split())
         else:
             expanded_tokens = words
@@ -132,7 +124,6 @@ def _worker_scan(args):
     local_word_counts = collections.Counter()
     local_len_counts = collections.Counter()
     
-    # We only scan raw words here; expansion happens in Phase 3
     for i in range(start_idx, end_idx, batch_size):
         slice_end = min(i + batch_size, end_idx)
         batch = dataset[i : slice_end]
@@ -178,7 +169,7 @@ def plot_caption_lengths(length_counts, save_path):
     plt.savefig(save_path)
     plt.close()
 
-def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json", save_map_path="lemma_map.json", num_workers=None):
+def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json", save_map_path="lemma_map.json", save_pos_path="pos_map.json", num_workers=None):
     print(f"Loading dataset from {arrow_path}...")
     dataset = load_from_disk(arrow_path)
     total_len = len(dataset)
@@ -206,82 +197,80 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
             global_raw_words.update(w_count)
             global_lengths.update(l_count)
 
-    # --- PHASE 2: Build Lemma Map (Spacy) with <MULTIPLE> ---
-    print("\nPhase 2: Building Lemma Map (Spacy) with Plural Detection...")
+    # --- PHASE 2: Build Lemma Map AND POS Map (Spacy) ---
+    print("\nPhase 2: Building Lemma Map & POS Map...")
     try:
         import spacy
-        # Note: We need the tagger for plural detection, so only disable NER/Parser
+        # Load small English model (disable NER/Parser for speed, keep Tagger for POS)
         nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
     except ImportError:
         print("Error: SpaCy not installed.")
         return
     except OSError:
-        print("Error: 'en_core_web_sm' not found.")
+        print("Error: 'en_core_web_sm' not found. Run: python -m spacy download en_core_web_sm")
         return
 
     unique_raw_words = list(global_raw_words.keys())
     lemma_map = {}
+    pos_map = {}  # NEW: Store Part-of-Speech tags
     
     batch_size = 5000
-    for i in tqdm(range(0, len(unique_raw_words), batch_size), desc="Lemmatizing"):
+    for i in tqdm(range(0, len(unique_raw_words), batch_size), desc="Lemmatizing & Tagging"):
         batch = unique_raw_words[i : i + batch_size]
         docs = list(nlp.pipe(batch))
         
         for original, doc in zip(batch, docs):
             token = doc[0]
             lemma = token.lemma_.lower().strip()
-            tag = token.tag_  # Part-of-Speech Tag
+            tag = token.tag_  # Fine-grained (e.g., NNS)
+            pos = token.pos_  # Coarse-grained (e.g., NOUN, VERB, ADJ)
             
-            # --- SKIP INVALID ---
+            # Save POS tag for every valid word
+            if len(original) > 1 and original.isalpha():
+                pos_map[original] = pos
+
+            # --- LEMMA LOGIC ---
             if not lemma or lemma == original:
-                # Even if it's identical ("dogs"->"dogs" error?), 
-                # we might still want to catch plurals if Spacy tagged it NNS.
-                # But usually "dogs"->"dog".
-                # If lemma == original, we skip mapping UNLESS it's a plural that wasn't lemmatized?
-                # Let's keep it simple: only map if changed OR if plural.
                 if tag not in ['NNS', 'NNPS']: 
                     continue
             
-            # --- PLURAL HANDLING ---
-            # If word is Plural Noun (NNS) or Proper Plural (NNPS)
-            # Append <MULTIPLE> token
+            # Plural handling
             if tag in ['NNS', 'NNPS']:
                 lemma = f"{lemma} <MULTIPLE>"
 
-            # --- SAFETY FILTERS ---
+            # Safety filters
             if original.endswith('s') and lemma.split()[0] == original[:-1] and len(original) > 4:
-                # "Olympus" -> "Olympu" protection (only if not tagged plural)
                 if tag not in ['NNS', 'NNPS']:
                     continue
-
             if original == "icing": continue 
 
             lemma_map[original] = lemma
 
+    # Save Lemma Map
     with open(save_map_path, 'w', encoding='utf-8') as f:
         json.dump(lemma_map, f, ensure_ascii=False, indent=4)
-    print(f"Lemma map saved. Size: {len(lemma_map)}")
+    
+    # Save POS Map (NEW)
+    with open(save_pos_path, 'w', encoding='utf-8') as f:
+        json.dump(pos_map, f, ensure_ascii=False, indent=4)
+        
+    print(f"Maps saved. Lemmas: {len(lemma_map)}, POS Tags: {len(pos_map)}")
 
     # --- PHASE 3: Build Final Vocab ---
     print("\nPhase 3: Building Final Vocab (Expanding Tokens)...")
     global_final_counts = collections.Counter()
     
     for raw_word, count in global_raw_words.items():
-        # Get lemma (e.g., "dogs" -> "dog <MULTIPLE>")
         final_string = lemma_map.get(raw_word, raw_word)
         
-        # ASCII Check
         if not re.match(r'^[\x00-\x7F]+$', final_string):
             continue
 
-        # Split! "dog <MULTIPLE>" -> ["dog", "<MULTIPLE>"]
-        # Both "dog" and "<MULTIPLE>" get the count increment
         sub_tokens = final_string.split()
         for t in sub_tokens:
             global_final_counts[t] += count
 
     os.makedirs("Plots", exist_ok=True)
-    # Use raw vs final for plot
     plot_rank_frequency_comparison(global_raw_words, global_final_counts, min_frequency, "Plots/vocab_rank_freq.png")
     plot_caption_lengths(global_lengths, "Plots/caption_length_hist.png")
 
@@ -293,11 +282,8 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
     vocab = {}
     vocab["<PAD>"] = 0
     vocab["<UNK>"] = 1
-    vocab["<MULTIPLE>"] = 2  # Explicit ID for our new token
+    vocab["<MULTIPLE>"] = 2 
     
-    # Start words at 3
-    # Check if <MULTIPLE> is in sorted_words to avoid duplicate
-    # It likely is, so we skip it in the loop
     current_idx = 3
     for word, _ in sorted_words:
         if word in ["<PAD>", "<UNK>", "<MULTIPLE>"]:

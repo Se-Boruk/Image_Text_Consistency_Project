@@ -87,43 +87,91 @@ ALL_VALID_CONCEPTS = list(set(ALL_VALID_CONCEPTS))
 
 
 
+# =========================================================
+# 4. PROTECTED WORDS (STOPLIST)
+# Words that provide structure but are not visual objects.
+# Swapping these usually breaks grammar or meaning too abstractly.
+# =========================================================
+PROTECTED_WORDS = {
+    "with", "from", "into", "onto", "over", "under", "next", "near", 
+    "that", "this", "those", "these", "what", "where", "when", 
+    "been", "being", "have", "has", "doing", "does", "done", "will", "would", 
+    "could", "should", "their", "your", "some", "many", "very", "much",
+    "background", "foreground", "image", "picture", "photo", "scene", "view",
+    "looking", "standing", "sitting", "wearing", "holding" # High freq verbs often better kept as anchors
+}
+
+# =========================================================
+# LOAD POS MAPS 
+# =========================================================
+POS_MAP = {}
+POS_GROUPS = {}
+
+try:
+    with open("pos_map.json", 'r', encoding='utf-8') as f:
+        POS_MAP = json.load(f)
+        
+    from collections import defaultdict
+    _temp_groups = defaultdict(list)
+    
+    # We filter the POS groups to only include "useful" words
+    # to avoid swapping common words with extremely rare/archaic ones.
+    domain_vocab = set(ALL_VALID_CONCEPTS)
+    
+    for word, pos in POS_MAP.items():
+        # Condition: Must be in our Visual Domain OR length > 3
+        if word in domain_vocab or len(word) > 3: 
+            _temp_groups[pos].append(word)
+            
+    POS_GROUPS = dict(_temp_groups)
+    print(f"Loaded POS Map: {len(POS_MAP)} words. Groups: {list(POS_GROUPS.keys())}")
+
+except FileNotFoundError:
+    print("Warning: pos_map.json not found! Fallback will be random.")
+
+
 def create_slightly_negative_caption(caption):
     """
-    Tworzy Hard Negative w oparciu o LEMATYZACJĘ OFFLINE.
-    Z dodanym mechanizmem 'Silly Fallback' na wypadek braku trafień w słownikach.
+    Creates a Hard Negative.
+    Priority 1: Logic/Pool swaps (Numbers, Colors, Objects).
+    Priority 2: Smart Fallback (Noun->Visual Noun, Verb->Verb).
     """
     if not caption: return None, False
 
     raw_tokens = Tok_lib.preprocess_text(caption)
     if not raw_tokens: return None, False
 
-    # 1. Kandydaci (Index, Strategia, Meta=Lemma)
+    # 1. Find High-Quality Candidates (Logic Swaps)
     candidates = [] 
     
     for i, token in enumerate(raw_tokens):
         token_lower = token.lower()
+        
+        # Skip Protected words immediately
+        if token_lower in PROTECTED_WORDS: continue
+        
         lemma = LEMMA_MAP.get(token_lower, token_lower)
 
-        if len(lemma) < 2 and not lemma.isdigit():
-            continue
+        # Skip short junk unless it's a number
+        if len(lemma) < 3 and not lemma.isdigit(): continue
 
         if lemma in NUMBERS_DICT or lemma.isdigit():
             candidates.append((i, "NUMBER", lemma))
-        elif lemma in WORD_TO_SHARED_GROUP:
-            source_group = WORD_TO_SHARED_GROUP[lemma]
-            if source_group in SHARED_RELATIONS:
-                candidates.append((i, "SHARED", source_group))
         elif lemma in STRICT_PAIRS:
             candidates.append((i, "STRICT", lemma))
         elif lemma in WORD_TO_POOL_ID:
             candidates.append((i, "POOL", lemma))
+        elif lemma in WORD_TO_SHARED_GROUP:
+            source_group = WORD_TO_SHARED_GROUP[lemma]
+            if source_group in SHARED_RELATIONS:
+                candidates.append((i, "SHARED", source_group))
 
     final_tokens = list(raw_tokens) 
     swaps_performed = 0
 
-    # --- LOGIKA GŁÓWNA ---
+    # --- STRATEGY 1: KNOWN LOGIC SWAPS (Best Quality) ---
     if candidates:
-        desired_swaps = random.choices([1, 2, 3], weights=[0.50, 0.4, 0.1], k=1)[0]
+        desired_swaps = random.choices([1, 2], weights=[0.85, 0.15], k=1)[0]
         num_swaps = min(desired_swaps, len(candidates))
         random.shuffle(candidates)
         targets = candidates[:num_swaps]
@@ -133,16 +181,11 @@ def create_slightly_negative_caption(caption):
 
             if strategy == "NUMBER":
                 val = int(meta) if meta.isdigit() else NUMBERS_DICT.get(meta, 1)
-                offset = random.choice([-1, 1, 2])
+                possible_offsets = [-2, -1, 1, 2]
+                offset = random.choice(possible_offsets)
                 new_val = max(1, val + offset)
                 if new_val == val: new_val += 1
                 new_word_lemma = str(new_val) if meta.isdigit() else NUMBERS_REVERSE.get(new_val, str(new_val))
-
-            elif strategy == "SHARED":
-                target_group_name = SHARED_RELATIONS[meta]
-                # Guardrail przed KeyError wspomniany wcześniej
-                if target_group_name in SHARED_DEFINITIONS:
-                    new_word_lemma = random.choice(SHARED_DEFINITIONS[target_group_name])
 
             elif strategy == "STRICT":
                 new_word_lemma = random.choice(STRICT_PAIRS[meta])
@@ -153,32 +196,68 @@ def create_slightly_negative_caption(caption):
                 if valid_options:
                     new_word_lemma = random.choice(valid_options)
 
+            elif strategy == "SHARED":
+                target_group_name = SHARED_RELATIONS[meta]
+                if target_group_name in SHARED_DEFINITIONS:
+                    new_word_lemma = random.choice(SHARED_DEFINITIONS[target_group_name])
+
             if new_word_lemma:
                 final_tokens[target_idx] = new_word_lemma
                 swaps_performed += 1
 
     # =========================================================
-    # SILLY FALLBACK (Jeśli słowniki zawiodły)
+    # STRATEGY 2: NATURAL FALLBACK (POS & Visual Aware)
     # =========================================================
     if swaps_performed == 0:
-        # Wybieramy indeksy słów, które mają sens semantyczny (dłuższe niż 2 znaki)
-        possible_indices = [idx for idx, t in enumerate(raw_tokens) if len(t) > 2]
+        # Filter indices: Length > 3 AND Not Protected
+        possible_indices = [
+            idx for idx, t in enumerate(raw_tokens) 
+            if len(t) > 3 and t.lower() not in PROTECTED_WORDS
+        ]
         
         if not possible_indices:
-            possible_indices = list(range(len(raw_tokens)))
+            # Last resort: Try length > 2 if strict filter failed
+            possible_indices = [idx for idx, t in enumerate(raw_tokens) if len(t) > 2]
     
-        target_idx = random.choice(possible_indices)
-        original_word = final_tokens[target_idx].lower()
-        
-        # Wybieramy słowo z puli ALL_VALID_CONCEPTS, omijając oryginał
-        # To zapewnia, że negatyw zawsze dotyczy obiektu z domeny (np. car, dog, pizza)
-        valid_fallback_options = [w for w in ALL_VALID_CONCEPTS if w != original_word]
-        
-        if valid_fallback_options:
-            final_tokens[target_idx] = random.choice(valid_fallback_options)
-            swaps_performed += 1
+        # Try up to 5 times to find a valid POS swap
+        for _ in range(5):
+            if not possible_indices: break
+            
+            target_idx = random.choice(possible_indices)
+            original_word = final_tokens[target_idx].lower()
+            original_pos = POS_MAP.get(original_word)
+            
+            replacement = None
 
-    return " ".join(final_tokens), True
+            # -----------------------------------------------
+            # Case A: It's a NOUN (The most critical swap)
+            # -----------------------------------------------
+            if original_pos in ["NOUN", "PROPN"]:
+                # Preference: Swap with a VISUAL CONCEPT (from your Pools)
+                # This turns "A man with a [hammer]" -> "A man with a [banana]"
+                # Instead of "A man with a [situation]" (Abstract noun)
+                if random.random() < 0.8: # 80% chance to force visual object
+                    replacement = random.choice(ALL_VALID_CONCEPTS)
+                else:
+                    # 20% chance for general noun from POS map
+                    if original_pos in POS_GROUPS:
+                        replacement = random.choice(POS_GROUPS[original_pos])
+
+            # -----------------------------------------------
+            # Case B: It's a VERB or ADJECTIVE
+            # -----------------------------------------------
+            elif original_pos in ["VERB", "ADJ"] and original_pos in POS_GROUPS:
+                replacement = random.choice(POS_GROUPS[original_pos])
+
+            # -----------------------------------------------
+            # Apply Swap if valid
+            # -----------------------------------------------
+            if replacement and replacement != original_word:
+                final_tokens[target_idx] = replacement
+                swaps_performed += 1
+                break
+            
+    return " ".join(final_tokens), (swaps_performed > 0)
 
 
 
@@ -340,7 +419,7 @@ class Custom_DataSet_Manager():
     
     
 class Async_DataLoader():
-    def __init__(self, dataset, batch_size=32, sequence_length = 128, num_workers=2, device='cuda', max_queue=10, image_augmentation = True , fraction = None):
+    def __init__(self, dataset, batch_size=32, sequence_length = 224, num_workers=2, device='cuda', max_queue=10, image_augmentation = True , fraction = None):
         self.dataset = dataset
         #Taking sample of from dataset to initialize the shape of images
         sample_img = np.array(dataset[0]["image"], dtype=np.uint8)
@@ -557,9 +636,10 @@ class Async_DataLoader():
                     actual_bs = end - start
                     
                     flip_flags = []
-        
+                    negative_from_batch = None
                     for i in range(actual_bs):
                         idx = self.indices[start + i]
+                        negative_from_batch = False
                         
                         # [Image Loading Logic ...] 
                         img = np.array(self.dataset[idx]["image"], dtype=np.float32) / 255.0
@@ -567,9 +647,10 @@ class Async_DataLoader():
                         
                         caption_positive = random.choice(caption_list)
                         rand_neg = random.random()
-                        if rand_neg < 0.15:
+                        if rand_neg < 0.07:
                             random_idx = random.randint(0, len(self.dataset) - 1)
                             caption_negative = random.choice(self.dataset[random_idx]['captions'])
+                            negative_from_batch = True
                         else:    
                             if random.choice([True, False]):
                                 caption_negative = random.choice(caption_list)
@@ -596,12 +677,17 @@ class Async_DataLoader():
 
 
                         # --- NEGATIVE SELECTION 
-                        caption_negative, _ = create_slightly_negative_caption(caption_negative)
-                        #caption_negative, succes = create_slightly_negative_caption(caption_positive)
-                        #if not succes:
-                            #print("Positive:", caption_positive)
-                            #print("Negative:", caption_negative)
-                            #print("="*40)
+                        if not negative_from_batch:
+                            caption_negative, success = create_slightly_negative_caption(caption_negative)
+                            if not success:
+                                # FALLBACK: If hard negative failed, use an "Easy Negative" (Random caption from dataset)
+                                # This ensures we never train on Pos == Neg
+                                random_idx = random.randint(0, len(self.dataset) - 1)
+                                # Ensure we don't pick the same image by accident
+                                while random_idx == idx: 
+                                    random_idx = random.randint(0, len(self.dataset) - 1)
+                                caption_negative = random.choice(self.dataset[random_idx]['captions'])
+   
                         
                         # [Encoding Logic ...]
                         caption_negative = Tokenizer.encode(caption_negative)
