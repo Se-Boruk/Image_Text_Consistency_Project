@@ -4,15 +4,14 @@ import json
 import os
 import re
 import matplotlib.pyplot as plt
-import numpy as np
 from tqdm import tqdm
 import multiprocessing
 import collections
 import Config 
 
-#===========================================================================
+#################################################
 # Functions directly for the Tokenizer and text processing
-#===========================================================================
+#################################################
 
 def preprocess_text(text):
     """
@@ -27,34 +26,39 @@ def preprocess_text(text):
     if not text:
         return []
 
-    # 1. Undercapitalize
+    #Undercapitalize
     text = text.lower()
     
-    # 2. SAFETY: Replace newlines with spaces
-    # This prevents "word.\nNext" from becoming "word.Next" if regex fails
+    #For safety and processing in database (mostly): Replace newlines with spaces
     text = text.replace('\n', ' ').replace('\r', ' ')
     
-    # 3. REMOVE NON-ASCII
+    #REMOVE NON-ASCII
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
     
-    # 4. EXPANDED PUNCTUATION SPLITTING
+    #EXPANDED PUNCTUATION SPLITTING
     text = re.sub(r'([.,!?;:()"\-+=_/—|<>@#%&*\[\]\'])', r' \1 ', text)
     
-    # 5. Collapse repeated punctuation
+    # Collapse repeated punctuation
     text = re.sub(r'([.,!?;:()"\-+=_/—|<>@#%&*\[\]\'])\1+', r'\1', text)
     
-    # 6. Split
+    #Split
     return text.split()
 
 
 class SimpleTokenizer:
+    """
+    Tokenizer which, well tokenizes the words into the numbers
+    
+    We can use it to encode string-sequence to the token list and vice versa
+    to decode the token list into the string sequence
+    """
     def __init__(self, vocab_path, lemma_map_path=None, max_length=None):
         
         # Opening created vocab.json file
         with open(vocab_path, 'r', encoding='utf-8') as f:
             self.vocab = json.load(f)
 
-        # Load Lemma Map
+        #Loading lemma map
         self.lemma_map = {}
         if lemma_map_path and os.path.exists(lemma_map_path):
             with open(lemma_map_path, 'r', encoding='utf-8') as f:
@@ -67,22 +71,23 @@ class SimpleTokenizer:
         self.pad_id = self.vocab.get("<PAD>", 0)
 
     def encode(self, text):
-        # 1. Preprocess
-        words = preprocess_text(text)
+        #Preprocess
+        words = self._preprocess_text(text)
         
-        # 2. Offline Lemmatization & Expansion
+        #Lemmatization
         expanded_tokens = []
         if self.lemma_map:
             for w in words:
                 mapped = self.lemma_map.get(w, w)
+                #split by space just in case mapped value is "base <MULTIPLE>"
                 expanded_tokens.extend(mapped.split())
         else:
             expanded_tokens = words
 
-        # 3. Map to IDs
+        #maping to ids
         tokens = [self.vocab.get(w, self.unk_id) for w in expanded_tokens]
         
-        # 4. Padding/Cropping
+        #Pad and cropping
         if self.max_length:
             tokens = tokens[:self.max_length]
             tokens += [self.pad_id] * (self.max_length - len(tokens))
@@ -113,9 +118,9 @@ class SimpleTokenizer:
         return " ".join(words)
 
 
-#===========================================================================
+#################################################
 # Functions to create the vocabulary
-#===========================================================================
+#################################################
 
 def _worker_scan(args):
     dataset_path, start_idx, end_idx, batch_size = args
@@ -148,28 +153,38 @@ def _worker_scan(args):
     return local_word_counts, local_len_counts
 
 def plot_rank_frequency_comparison(raw_counts, lemma_counts, min_frequency, save_path):
+    
     sorted_raw = sorted(raw_counts.values(), reverse=True)
     sorted_lemma = sorted(lemma_counts.values(), reverse=True)
     
     plt.figure(figsize=(12, 8))
+    
     plt.plot(sorted_raw, color='gray', linestyle=':', linewidth=1.5, label='Raw Words')
     plt.plot(sorted_lemma, color='darkblue', linewidth=2.0, label='Lemmatized + <MULTIPLE>')
     plt.axhline(y=min_frequency, color='red', linestyle='--', label=f'Cutoff ({min_frequency})')
+    
     plt.yscale('log')
     plt.legend()
     plt.title('Vocabulary Compression Analysis')
+    
     plt.savefig(save_path)
     plt.close()
+
 
 def plot_caption_lengths(length_counts, save_path):
+    
     lengths = sorted(length_counts.keys())
     counts = [length_counts[l] for l in lengths]
+    
     plt.figure(figsize=(10, 6))
     plt.bar(lengths, counts, color='forestgreen', alpha=0.7)
+    
     plt.savefig(save_path)
     plt.close()
 
+
 def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json", save_map_path="lemma_map.json", save_pos_path="pos_map.json", num_workers=None):
+    
     print(f"Loading dataset from {arrow_path}...")
     dataset = load_from_disk(arrow_path)
     total_len = len(dataset)
@@ -177,7 +192,7 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
     if num_workers is None:
         num_workers = max(1, multiprocessing.cpu_count() - 2)
     
-    # --- PHASE 1: Scan Raw Words ---
+    #Scanning raw words
     print(f"Phase 1: Scanning Raw Words with {num_workers} workers...")
     chunk_size = total_len // num_workers
     worker_args = []
@@ -197,11 +212,13 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
             global_raw_words.update(w_count)
             global_lengths.update(l_count)
 
-    # --- PHASE 2: Build Lemma Map AND POS Map (Spacy) ---
+
+    #Building lemma map and position map (using spacy lib)
     print("\nPhase 2: Building Lemma Map & POS Map...")
     try:
         import spacy
-        # Load small English model (disable NER/Parser for speed, keep Tagger for POS)
+        #Load small English model (disable NER/Parser for speed, keep Tagger for POS)
+        
         nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
     except ImportError:
         print("Error: SpaCy not installed.")
@@ -212,7 +229,7 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
 
     unique_raw_words = list(global_raw_words.keys())
     lemma_map = {}
-    pos_map = {}  # NEW: Store Part-of-Speech tags
+    pos_map = {} 
     
     batch_size = 5000
     for i in tqdm(range(0, len(unique_raw_words), batch_size), desc="Lemmatizing & Tagging"):
@@ -222,23 +239,23 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
         for original, doc in zip(batch, docs):
             token = doc[0]
             lemma = token.lemma_.lower().strip()
-            tag = token.tag_  # Fine-grained (e.g., NNS)
-            pos = token.pos_  # Coarse-grained (e.g., NOUN, VERB, ADJ)
+            tag = token.tag_ 
+            pos = token.pos_  
             
-            # Save POS tag for every valid word
+            #Save POS tag for every valid word
             if len(original) > 1 and original.isalpha():
                 pos_map[original] = pos
 
-            # --- LEMMA LOGIC ---
+            #Lemma logic
             if not lemma or lemma == original:
                 if tag not in ['NNS', 'NNPS']: 
                     continue
             
-            # Plural handling
+            #Plural world handling
             if tag in ['NNS', 'NNPS']:
                 lemma = f"{lemma} <MULTIPLE>"
 
-            # Safety filters
+            #Safety filtering
             if original.endswith('s') and lemma.split()[0] == original[:-1] and len(original) > 4:
                 if tag not in ['NNS', 'NNPS']:
                     continue
@@ -246,11 +263,10 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
 
             lemma_map[original] = lemma
 
-    # Save Lemma Map
+    #Saving lemma and pos
     with open(save_map_path, 'w', encoding='utf-8') as f:
         json.dump(lemma_map, f, ensure_ascii=False, indent=4)
     
-    # Save POS Map (NEW)
     with open(save_pos_path, 'w', encoding='utf-8') as f:
         json.dump(pos_map, f, ensure_ascii=False, indent=4)
         
@@ -278,7 +294,7 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
     filtered_vocab = {w: c for w, c in global_final_counts.items() if c >= min_frequency}
     sorted_words = sorted(filtered_vocab.items(), key=lambda item: item[1], reverse=True)
     
-    # --- SPECIAL TOKENS ---
+    #Special tokens coverage
     vocab = {}
     vocab["<PAD>"] = 0
     vocab["<UNK>"] = 1
@@ -300,3 +316,6 @@ def create_vocabulary(arrow_path, min_frequency=5, save_vocab_path="vocab.json",
 if __name__ == "__main__":
     path = Config.DATABASE_PATH
     create_vocabulary(path, min_frequency=2, num_workers=5)
+    
+    
+    

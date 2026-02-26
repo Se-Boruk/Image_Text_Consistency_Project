@@ -6,7 +6,7 @@ def run_tests():
     
     # Ensure files exist
     if not os.path.exists("vocab.json") or not os.path.exists("lemma_map.json"):
-        print("❌ Error: vocab.json or lemma_map.json not found!")
+        print("Error: vocab.json or lemma_map.json not found!")
         return
 
     # Initialize Tokenizer

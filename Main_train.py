@@ -4,12 +4,9 @@
 from tqdm import tqdm
 import os
 import warnings
-
+import math
 import csv
-import numpy as np
-
 from transformers import logging as transformers_logging
-
 import torch
 from torchinfo import summary
 import torch.optim as optim
@@ -19,7 +16,7 @@ from DataBase_functions import Custom_DataSet_Manager
 from DataBase_functions import Async_DataLoader
 import DataBase_functions as d_func
 
-import Tokenizer_lib as Tok_lib
+
 import Functions as functions
 import Architectures as Arch
 import Config
@@ -162,15 +159,14 @@ model = Arch.Siamese_model(Image_model = image_model,
                            )
 
 
-# --- LOGIKA TRANSFER LEARNINGU (MROŻENIE) ---
-# Na start mrozimy backbone ResNetu, by nie psuć wag na początku
+#Transfer learning for the ResNet backbone
 for param in model.img_enc.backbone.parameters():
     param.requires_grad = False
-print("Backbone frozen for initial warm-up (Head-only training).")
+print("Backbone frozen for initial warm-up")
 
 
 
-
+#Loss function set up
 criterion = functions.Custom_loss(margin = LOSS_MARGIN,
                                   triplet_weight = 3, 
                                   contrastive_weight = 1.0,
@@ -180,11 +176,11 @@ criterion = functions.Custom_loss(margin = LOSS_MARGIN,
 params_to_optimize = list(model.parameters()) + list(criterion.parameters())
 
 
-# Optimizer (AdamW jest świetny dla Fine-tuningu)
+# Optimizer
 optimizer = optim.AdamW(params_to_optimize,
                         lr=LR,
                         betas=(0.9, 0.98),
-                        weight_decay=0.04, # Zwiększony weight decay dla stabilności ResNetu    
+                        weight_decay=0.04,
                         eps=1e-8
                     )
 
@@ -196,7 +192,6 @@ optimizer = optim.AdamW(params_to_optimize,
 model.move_to_device("cpu")
 
 print("\n" + "="*30 + " IMAGE ENCODER " + "="*30)
-# We use print() to force it to show in the console/notebook output
 print(summary(model.img_enc, 
               input_size=(BATCH_SIZE, 3, 224, 224), 
               col_names=["input_size", "output_size", "num_params"],
@@ -205,29 +200,27 @@ print(summary(model.img_enc,
 print("\n" + "="*30 + " TEXT ENCODER " + "="*30)
 print(summary(model.txt_enc, 
               input_size=(BATCH_SIZE, SEQUENCE_LENGTH),
-              dtypes=[torch.long], # Critical for Embedding layer
+              dtypes=[torch.long],
               col_names=["input_size", "output_size", "num_params"],
               device=device))
-
 
 
 
 ###################################################################
 # ( 6 ) Training the model
 ###################################################################
-
-
-
 UNFREEZE_EPOCH = 6
+accumulation_steps = 4
 
-# --- CONFIGURATION ---
+#Other hardcoded specs - not as important for the training itself
 CSV_LOG_PATH = "Plots/training_log.csv"
 CHECKPOINT_PATH = "Models/Trained/best_model.pth"
 CHECKPOINT_DIR = "Models/Trained/checkpoints"
 best_val_loss = float('inf')
 patience_counter = 0
 SAVE_EVERY = 2
-# Initialize CSV with expanded headers
+
+#CsV initialization for logs
 if not os.path.exists(CSV_LOG_PATH):
     with open(CSV_LOG_PATH, mode='w', newline='') as f:
         writer = csv.writer(f)
@@ -236,10 +229,9 @@ if not os.path.exists(CSV_LOG_PATH):
             "V_Loss", "V_B_Acc", "V_Recall", "V_Spec", "Thresh"
         ])
         
-###############
+##########################
 
-accumulation_steps = 4
-import math
+
 steps_per_epoch = math.ceil(train_loader.get_num_batches() / accumulation_steps)
 total_updates = steps_per_epoch * EPOCHS
 
@@ -261,24 +253,24 @@ model.train_mode()
 
 
 
-
+#################################################################
 print(f"Starting training on {device}!\n\n")
 
 for e in range(EPOCHS):
     
-    # --- DYNAMICZNE ODMRAŻANIE (Curriculum Learning) ---
+    #Unfroze the backbone when the epoch is met
     if e + 1 == UNFREEZE_EPOCH:
         for param in model.img_enc.backbone.parameters():
             param.requires_grad = True
-        print(f"\n>>> Epoch {e+1}: Backbone unfrozen! Starting fine-tuning of the whole model.")
+        print(f"\n Epoch {e+1}!: Backbone unfrozen. Starting fine-tuning of the whole model")
         
-        # Opcjonalnie: Możesz tu zredukować LR optymalizatora o połowę po odmrożeniu
+        #Lr reduction for the backbone
         for param_group in optimizer.param_groups:
             param_group['lr'] = param_group['lr'] * 0.5
 
-    # ==========================================
-    # 1. TRAINING PHASE
-    # ==========================================
+    #######################################################################
+    #1) Training phase
+    #######################################################################
     model.train()
     model.train_mode()
     optimizer.zero_grad()
@@ -301,24 +293,24 @@ for e in range(EPOCHS):
             batch_caption_n = batch['caption_negative']
     
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                # FIXED: Unpack 6 values including masks
+                #Unpacking 6 outputs from the model
                 v_main, v_aug, t_pos, t_neg, m_pos, m_neg = model(batch_image, batch_image_aug, batch_caption_p, batch_caption_n)
                 
-                # FIXED: Use cross-attention calculation for calibration scores
+                #Cross-attention calculation for calibration scores
                 score_pos = criterion._get_paired_similarity(v_main, t_pos, m_pos)
                 score_neg = criterion._get_paired_similarity(v_main, t_neg, m_neg)
                 
                 train_pos_scores.append(score_pos.detach().cpu())
                 train_neg_scores.append(score_neg.detach().cpu())
     
-                # FIXED: Pass masks to criterion
+                #Passing to the loss function
                 loss = criterion(v_main, v_aug, t_pos, t_neg, m_pos, m_neg) / accumulation_steps
     
             scaler.scale(loss).backward()
             c += 1
             
             is_last_batch = (pbar.n + 1 == num_train_batches)
-            
+            #Accumulation as contrastive loss works best in the bigger batch sizes
             if (c % accumulation_steps == 0) or is_last_batch:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -336,14 +328,14 @@ for e in range(EPOCHS):
             pbar.update(1)
             pbar.set_postfix({"loss": f"{current_loss:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
 
-    # Konwersja wyników treningowych do metryk
+    #Train params to metric conversion
     train_pos_scores = torch.cat(train_pos_scores).numpy()
     train_neg_scores = torch.cat(train_neg_scores).numpy()
     avg_train_loss = train_epoch_loss / num_train_batches
 
-    # ==========================================
-    # 2. VALIDATION PHASE
-    # ==========================================
+    #######################################################################
+    #2) Validation phase
+    #######################################################################
     model.eval()
     model.eval_mode()
     val_loader.start_epoch(shuffle=False)
@@ -363,14 +355,14 @@ for e in range(EPOCHS):
                 img_augmented = batch.get('image_augmented', img_original)
     
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    # FIXED: Unpack 6 values including masks
+                    #Unpacking 6 outputs from the model
                     v_m, v_a, t_p, t_n, m_p, m_n = model(img_original, img_augmented, 
                                                          batch['caption_positive'], batch['caption_negative'])
                     
-                    # FIXED: Pass masks to criterion
+                    #Cross-attention calculation for calibration scores
                     loss = criterion(v_m, v_a, t_p, t_n, m_p, m_n)
                     
-                    # FIXED: Use cross-attention calculation for validation scores
+                    #Passint to the loss function
                     score_pos = criterion._get_paired_similarity(v_m, t_p, m_p)
                     score_neg = criterion._get_paired_similarity(v_m, t_n, m_n)
                     
@@ -383,7 +375,7 @@ for e in range(EPOCHS):
     val_pos_scores = torch.cat(val_pos_scores).numpy()
     val_neg_scores = torch.cat(val_neg_scores).numpy()
     
-    # --- KLUCZOWA ZMIANA: Kalibracja na VAL ---
+    #Calibration of the treshold-  made on the validation score
     current_threshold = functions.calibrate_threshold(val_pos_scores, val_neg_scores)
     
     t_b_acc, t_recall, t_spec = functions.calculate_metrics(train_pos_scores, train_neg_scores, current_threshold)
@@ -395,9 +387,9 @@ for e in range(EPOCHS):
     print(f"T_Loss: {avg_train_loss:.4f} | T_B_Acc: {t_b_acc:.4f} | T_Rec: {t_recall:.4f} | T_Spec: {t_spec:.4f}")
     print(f"V_Loss: {avg_val_loss:.4f} | V_B_Acc: {v_b_acc:.4f} | V_Rec: {v_recall:.4f} | V_Spec: {v_spec:.4f} | Thresh: {current_threshold:.2f}")
 
-    # ==========================================
-    # 3. LOGGING (IRT)
-    # ==========================================
+    #######################################################################
+    #3) Logging
+    #######################################################################
     with open(CSV_LOG_PATH, mode='a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -409,9 +401,9 @@ for e in range(EPOCHS):
         f.flush()
         os.fsync(f.fileno())
 
-    # ==========================================
-    # 4. CHECKPOINTING & PERIODIC SAVING
-    # ==========================================
+    #######################################################################
+    #3) Checkpoints and periodic saves
+    #######################################################################
     checkpoint_data = {
         'epoch': e + 1,
         'model_state_dict': model.state_dict(),
@@ -421,7 +413,7 @@ for e in range(EPOCHS):
         'val_balanced_acc': float(v_b_acc)          
         }
 
-    # Condition A: Improvement (Save as Best)
+    # Save as best
     if avg_val_loss < best_val_loss:
         print(f"Improvement: Saving best model to {CHECKPOINT_PATH}")
         best_val_loss = avg_val_loss
@@ -431,7 +423,7 @@ for e in range(EPOCHS):
         patience_counter += 1
         print(f"No improvement. Patience: {patience_counter}/{PATIENCE}")
 
-    # Condition B: Periodic Save (Save every N epochs)
+    #Periodic save
     if (e + 1) % SAVE_EVERY == 0:
         periodic_name = f"{CHECKPOINT_DIR}/checkpoint_epoch_{e+1}.pth"
         print(f"Periodic Save: Saving checkpoint to {periodic_name}")

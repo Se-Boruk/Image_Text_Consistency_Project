@@ -1,64 +1,51 @@
-from datasets import load_dataset, load_from_disk
-import os
+from datasets import load_from_disk
 import numpy as np
 import torch
 from queue import Queue
 import threading
 import random
-import math
 import torch.nn.functional as F
-import torch
 from PIL import Image as PILImage
 from collections import Counter
 from datasets import ClassLabel
 import hashlib
-import torch
-import time
-import random
-from transformers import AutoTokenizer
-import math
-import re
-import random
-import torch
-import time
-import json
 import Tokenizer_lib as Tok_lib
 from Config import SOURCE_MAP
 from Negative_map import NUMBERS_DICT, CATEGORY_POOLS, STRICT_PAIRS, SHARED_RELATIONS, SHARED_DEFINITIONS
-import random
 import spacy
 import pyinflect
 
-# =========================================================
-# INITIALIZATION (Budowanie Indeksów - Uruchamiane raz)
-# =========================================================
+#######################################################################
+#Constants initializations, for optimalization or just preparing. Mostly for negative creation
+#######################################################################
 
-# 1. Reverse Map dla Shared Groups: "man" -> "MALE_HUMAN"
+#Reverse map for shared groups: "man" -> "MALE_HUMAN"
 WORD_TO_SHARED_GROUP = {}
 for group_name, words in SHARED_DEFINITIONS.items():
     for w in words:
         WORD_TO_SHARED_GROUP[w] = group_name
 
-# 2. Reverse Map dla Pools: "red" -> "COLORS"
+#Reverse map for pool groups: "red" -> "COLORS"
 WORD_TO_POOL_ID = {}
 for pool_name, words in CATEGORY_POOLS.items():
     for w in words:
         WORD_TO_POOL_ID[w] = pool_name
 
-#SWAP OF NONE NEGATIVES
+#Swap of none negatives
 ALL_VALID_CONCEPTS = []
 for pool in CATEGORY_POOLS.values():
     ALL_VALID_CONCEPTS.extend(pool)
 for group in SHARED_DEFINITIONS.values():
     ALL_VALID_CONCEPTS.extend(group)
-# Usunięcie duplikatów dla czystości puli
+    
+#Removing duplicates
 ALL_VALID_CONCEPTS = list(set(ALL_VALID_CONCEPTS))
 
 
 
-# =========================================================
-# 4. PROTECTED WORDS (STOPLIST)
-# =========================================================
+######################################################
+#Protected words (to not destroy context)
+######################################################
 PROTECTED_WORDS = {
     "with", "from", "into", "onto", "over", "under", "next", "near", 
     "that", "this", "those", "these", "what", "where", "when", 
@@ -68,38 +55,37 @@ PROTECTED_WORDS = {
     "looking", "standing", "sitting", "wearing", "holding"
 }
 
-# =========================================================
-# LOAD POS MAPS 
-# =========================================================
+#Loading position maps
 POS_MAP = {}
 POS_GROUPS = {}
 
 try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
-    print("CRITICAL: spaCy model not found. Run: python -m spacy download en_core_web_sm")
+    print("CRITICAL: spaCy model not found")
     nlp = None
 
 def create_slightly_negative_caption(caption):
     """
-    Creates a Hard Negative with strict morphological inheritance.
-    Prevents sequence-based networks (LSTMs) from detecting grammatical artifacts.
+    Creates a Hard Negative with strict morphological inheritance
+    Prevents LSTM from detecting grammatical artifacts and basing its decision on that (in theory)
     """
     if not caption or nlp is None: 
         return None, False
 
-    # Process sentence to establish syntax dependencies and exact POS tags
+
+    #Process sentence to establish syntax dependencies and exact POS tags
     doc = nlp(caption)
     candidates = []
     
-    # 1. Find High-Quality Candidates using contextual lemmas
+    #Find High-Quality Candidates using contextual lemmas
     for i, token in enumerate(doc):
         if token.lower_ in PROTECTED_WORDS or token.is_punct: 
             continue
             
         lemma = token.lemma_.lower()
 
-        # Route to strategies
+        #Route to strategies
         if lemma in NUMBERS_DICT or token.pos_ == "NUM":
             candidates.append((i, "NUMBER", lemma, token))
         elif lemma in STRICT_PAIRS:
@@ -110,26 +96,27 @@ def create_slightly_negative_caption(caption):
             source_group = WORD_TO_SHARED_GROUP[lemma]
             if source_group in SHARED_RELATIONS:
                 candidates.append((i, "SHARED", source_group, token))
-        # Dynamic POS Fallback: Rely on spaCy's tags, not the static POS_MAP
+                
+        #Dynamic POS Fallback: Rely on spaCy tags, not the static POS_MAP
         elif token.pos_ in ["NOUN", "PROPN", "VERB", "ADJ"] and len(lemma) > 3:
             candidates.append((i, "POS_FALLBACK", token.pos_, token))
 
     if not candidates:
         return None, False
 
-    # 2. Select Targets (Updated for equal 1, 2, or 3 swap probability)
+    #Select Targets (Updated for equal 1, 2, or 3 swap probability)
     desired_swaps = random.choice([1, 2, 3])
     num_swaps = min(desired_swaps, len(candidates))
     targets = random.sample(candidates, num_swaps)
 
-    # Convert document to a list of strings preserving original whitespace
+    #Convert document to a list of strings preserving original whitespace
     final_tokens = [t.text_with_ws for t in doc]
     swaps_performed = 0
 
     for target_idx, strategy, meta, original_token in targets:
         new_word_lemma = None
 
-        # Execute Swap Strategy
+        #Execute Swap Strategy
         if strategy == "NUMBER":
             val = int(meta) if meta.isdigit() else NUMBERS_DICT.get(meta, 1)
             offset = random.choice([-2, -1, 1, 2])
@@ -158,21 +145,21 @@ def create_slightly_negative_caption(caption):
             elif meta in POS_GROUPS and POS_GROUPS[meta]:
                 new_word_lemma = random.choice(POS_GROUPS[meta])
 
-        # 3. Morphological Inheritance & String Reconstruction
+        #Morph inheritance and stsring reconstruction
         if new_word_lemma:
-            # Use module-level getInflection to inflect the new word to match the old word's tag
+            #Use module-level getInflection to inflect the new word to match the old word's tag
             inflected_tuple = pyinflect.getInflection(new_word_lemma, original_token.tag_)
             
-            # Extract the first valid inflection, or fallback to the raw lemma if unavailable
+            #Extract the first valid inflection, or fallback to the raw lemma if unavailable
             final_word = inflected_tuple[0] if inflected_tuple else new_word_lemma
             
-            # Inherit capitalization structure
+            #Inherit capitalization structure
             if original_token.is_title:
                 final_word = final_word.title()
             elif original_token.is_upper:
                 final_word = final_word.upper()
                 
-            # Reconstruct string, maintaining natural spacing
+            #Reconstruct string, maintaining natural spacing
             ws = original_token.whitespace_
             final_tokens[target_idx] = final_word + ws
             swaps_performed += 1
@@ -180,13 +167,8 @@ def create_slightly_negative_caption(caption):
     if swaps_performed == 0:
         return None, False
 
-    # Join the array back into a continuous string
+    #Join the array back into a continuous string
     return "".join(final_tokens).strip(), True
-
-
-
-
-
 
 
 
@@ -199,8 +181,11 @@ def verify_splits(train, val, test):
             print(f" - {src}: {count} ({count/total:.2%})")
 
 def verify_dataset_integrity(train_ds, val_ds, test_ds, expected_hashes=None):
+    """
+    Old function checking train/val/test splits based on the hashes. 
+    In constant experimenting and database updating it was abandoned
+    """
 
-    
     samples = {
         "train": str(train_ds[0]['caption']),
         "val": str(val_ds[0]['caption']),
@@ -236,13 +221,13 @@ def verify_dataset_integrity(train_ds, val_ds, test_ds, expected_hashes=None):
 
 def preprocess_image_to_square(img_input, target_size=224):
     """
-    Universal preprocessor for PIL, NumPy, or Torch inputs.
-    Resizes maintaining aspect ratio and pads to a square.
+    Process image before feeding into network
+    Resizes maintaining aspect ratio and pads to a square
     """
     
     #COnversion logic
     if isinstance(img_input, torch.Tensor):
-        # Handle (C, H, W) or (H, W, C) tensors
+        #Handle (C, H, W) or (H, W, C) tensors
         
         if img_input.ndimension() == 3 and img_input.shape[0] in [1, 3]:
             img_input = img_input.permute(1, 2, 0)
@@ -254,7 +239,7 @@ def preprocess_image_to_square(img_input, target_size=224):
             img_input = (img_input * 255).astype(np.uint8)
         img = PILImage.fromarray(img_input)
     else:
-        # Assume already a PIL image or try to force it
+        #Assume already a PIL image or try to force it
         img = img_input
 
     #Standardization to RGB
@@ -406,110 +391,87 @@ class Async_DataLoader():
                         brightness=0.2, contrast=0.2, saturation=0.2,
                         flip_prob=0.5, max_rot=15, crop_ratio=0.85, 
                         p_spatial=0.8, p_color=0.8, p_gray=0.15):
-        """
-        Zoptymalizowana augmentacja z flagami per-obrazek (flip_allowed).
-        
-        Args:
-            image_batch (Tensor): [B, C, H, W] - batch obrazów (0-1).
-            flip_allowed (Tensor Bool): [B] - maska określająca czy dany obrazek MOŻE być odbity.
-                                      Jeśli None, wszystkie mogą być odbite.
-        """
+
         B, C, H, W = image_batch.shape
         device = image_batch.device
         dtype = image_batch.dtype
         
-        # Klonowanie, aby nie modyfikować oryginału w pamięci pinned
+        #Cloning to not alter the original
         image_batch = image_batch.clone()
 
-        # Domyślnie pozwalamy na flip wszystkim, jeśli nie podano flag
+        #Flip allowed by default
         if flip_allowed is None:
             flip_allowed = torch.ones(B, dtype=torch.bool, device=device)
 
-        # ==================================================================
-        # 1. TRANSFORMACJE PRZESTRZENNE (Single-Pass Affine)
-        # ==================================================================
-        # Losujemy, które obrazki w ogóle podlegają transformacji przestrzennej
+
         spatial_mask = torch.rand(B, device=device) < p_spatial
         
         if spatial_mask.any():
-            # Liczba obrazków do przetworzenia
             B_sub = spatial_mask.sum().item()
-            
-            # Wyciągamy flagi flipa TYLKO dla przetwarzanych obrazków
-            # To krytyczne: mapujemy [B] -> [B_sub]
             flip_allowed_sub = flip_allowed[spatial_mask]
 
-            # --- A. Parametry losowe dla każdego obrazka ---
             
-            # Rotacja (w radianach)
+            
+            #Rotation
             angles = (torch.rand(B_sub, device=device) * 2 - 1) * max_rot
             radians = angles * (3.14159265 / 180)
             
-            # Skalowanie (Zoom in)
-            # Randomizacja zoomu: od crop_ratio do 1.0
+            #Scaling (zoom in)
             curr_crop = crop_ratio + (torch.rand(B_sub, device=device) * (1.0 - crop_ratio))
             scale = 1.0 / curr_crop
             
-            # Przesunięcie (Shift)
-            # Maksymalne przesunięcie zależy od tego, jak mocno przybliżyliśmy
+            #Shift
             max_shift = 1.0 - curr_crop
             tx = (torch.rand(B_sub, device=device) * 2 - 1) * max_shift
             ty = (torch.rand(B_sub, device=device) * 2 - 1) * max_shift
 
-            # --- B. Logika Inteligentnego Flipa ---
             
-            # 1. "Chęć" flipa (losowa szansa)
+            #Flip logic
             wants_flip = torch.rand(B_sub, device=device) < flip_prob
             
-            # 2. Ostateczna decyzja (AND logiczny): Chce flipa ORAZ ma pozwolenie
             actual_flip_mask = wants_flip & flip_allowed_sub
             
-            # 3. Tworzymy wektor mnożnika: 1.0 (brak flipa) lub -1.0 (flip)
             flip_factor = torch.ones(B_sub, device=device)
             flip_factor[actual_flip_mask] = -1.0
             
-            # --- C. Konstrukcja Macierzy Afinicznej ---
             
+            #Final affine matrix (to reduce operations)
             cos = torch.cos(radians) * scale
             sin = torch.sin(radians) * scale
             
             affine_mats = torch.zeros(B_sub, 2, 3, device=device, dtype=dtype)
-            
-            # Oś X (mnożymy przez flip_factor, aby uzyskać odbicie lustrzane)
+            #X
             affine_mats[:, 0, 0] = cos * flip_factor 
             affine_mats[:, 0, 1] = -sin
             affine_mats[:, 0, 2] = tx
             
-            # Oś Y
+            #Y
             affine_mats[:, 1, 0] = sin * flip_factor # Rotacja musi uwzględniać zmianę układu
             affine_mats[:, 1, 1] = cos
             affine_mats[:, 1, 2] = ty
 
-            # --- D. Aplikacja (Grid Sample) ---
+            #Grid sample
             grid = F.affine_grid(affine_mats, [B_sub, C, H, W], align_corners=False)
             
-            # Używamy trybu 'reflection', żeby nie było czarnych ramek przy obrocie
+            #Reflection
             image_batch[spatial_mask] = F.grid_sample(
                 image_batch[spatial_mask], grid, 
                 mode='bicubic', padding_mode='reflection', align_corners=False
             )
 
-        # ==================================================================
-        # 2. GRAYSCALE (Wymuszanie semantyki kształtu)
-        # ==================================================================
+        #Grauscale
         if C == 3:
             gray_mask = torch.rand(B, 1, 1, 1, device=device) < p_gray
             if gray_mask.any():
-                # ITU-R 601-2 luma transform
+
                 luma = (image_batch[:, 0:1] * 0.299 + 
                         image_batch[:, 1:2] * 0.587 + 
                         image_batch[:, 2:3] * 0.114)
-                # Powielamy kanał 3 razy, żeby zachować wymiar [B, 3, H, W]
+                #copy 3 times to keep the tensor size
                 image_batch = torch.where(gray_mask, luma.repeat(1, 3, 1, 1), image_batch)
 
-        # ==================================================================
-        # 3. COLOR JITTERING (Jasność, Kontrast, Nasycenie)
-        # ==================================================================
+
+        #Color jittering
         color_mask = torch.rand(B, 1, 1, 1, device=device) < p_color
         if color_mask.any():
             # Brightness
@@ -521,7 +483,7 @@ class Async_DataLoader():
             c_factors = 1.0 + (torch.rand(B, 1, 1, 1, device=device) * 2 - 1) * contrast
             image_batch = torch.where(color_mask, (image_batch - mean) * c_factors + mean, image_batch)
 
-            # Saturation (Tylko RGB)
+            # Saturation
             if C == 3:
                 gray = image_batch.mean(dim=1, keepdim=True)
                 s_factors = 1.0 + (torch.rand(B, 1, 1, 1, device=device) * 2 - 1) * saturation
@@ -732,13 +694,6 @@ class Async_DataLoader():
         """
         Returns a random batch of original images from the dataset, reproducible if rng is provided.
         
-        Args:
-            batch_size: int, optional
-            shuffle: bool, whether to pick random indices
-            rng: np.random.Generator, optional — if given, sampling becomes deterministic
-    
-        Returns:
-            batch tensor of shape (B, C, H, W)
         """
         bs = batch_size or self.batch_size
     

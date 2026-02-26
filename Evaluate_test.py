@@ -4,25 +4,20 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
 
-# Import your custom modules
 import Config
 import Architectures as Arch
 from DataBase_functions import Custom_DataSet_Manager, Async_DataLoader
 
-# ==========================================
-# 1. CONFIGURATION & VARIABLES
-# ==========================================
+
+#Settings params and hardware
 MODEL_NAME = "best_model.pth" 
 CHECKPOINT_PATH = os.path.join("Models", "Trained", MODEL_NAME)
 PLOT_SAVE_DIR = "Plots"
 
-# Hardware
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# ==========================================
-# 2. DATA LOADING (TEST SET ONLY)
-# ==========================================
+
 print("\nLoading Test Data...")
 manager = Custom_DataSet_Manager(
     DataSet_path=Config.DATABASE_PATH,
@@ -32,7 +27,7 @@ manager = Custom_DataSet_Manager(
     random_state=Config.RANDOM_STATE
 )
 
-# We only need the Test set
+
 _, _, Test_set = manager.load_dataset_from_disk()
 
 test_loader = Async_DataLoader(
@@ -46,9 +41,10 @@ test_loader = Async_DataLoader(
     fraction=1
 )
 
-# ==========================================
-# 3. MODEL SETUP & LOADING
-# ==========================================
+
+##########################################
+#Model setup and loading
+##########################################
 print(f"\nLoading Model: {MODEL_NAME}...")
 
 text_model = Arch.Text_encoder(
@@ -70,7 +66,10 @@ model = Arch.Siamese_model(
     device=device
 )
 
-# --- ROBUST WEIGHT LOADING ---
+
+##########################################
+#Loading weights - wit fallbacks
+##########################################
 if os.path.exists(CHECKPOINT_PATH):
     try:
         # Try loading normally
@@ -100,9 +99,9 @@ else:
 model.move_to_device()
 model.eval_mode()
 
-# ==========================================
-# 4. INFERENCE LOOP
-# ==========================================
+##########################################
+#Inference loop
+##########################################
 pos_scores = []
 neg_scores = []
 
@@ -131,9 +130,9 @@ with torch.no_grad():
 pos_scores = torch.cat(pos_scores).numpy()
 neg_scores = torch.cat(neg_scores).numpy()
 
-# ==========================================
-# 5. THRESHOLD ANALYSIS
-# ==========================================
+##########################################
+#Treshold analysis
+##########################################
 print("\nCalculating Metrics across thresholds...")
 
 thresholds = np.linspace(0.0, 1.0, 101)
@@ -159,14 +158,17 @@ for t in thresholds:
     b_accs.append(b_acc)
     diffs.append(diff)
 
-# --- FIND CRITICAL THRESHOLDS ---
 
-# 1. Max Balanced Accuracy
+##########################################
+#Finding best thresholds for given conditions (specificity, recall and bal_acc)
+##########################################
+
+#Max Balanced Accuracy
 max_acc = max(b_accs)
 idx_max = b_accs.index(max_acc)
 t_max_acc = thresholds[idx_max]
 
-# 2. Equilibrium
+#Equilibrium (same recall and spec)
 min_diff = min(diffs)
 idx_eq = diffs.index(min_diff)
 t_equilibrium = thresholds[idx_eq]
@@ -185,9 +187,9 @@ print(f"   -> Recall: {recalls[idx_eq]:.4f}")
 print(f"   -> Spec:   {specificities[idx_eq]:.4f}")
 print("="*40)
 
-# ==========================================
-# 6. PLOTTING (ENHANCED)
-# ==========================================
+##########################################
+#Plotting
+##########################################
 os.makedirs(PLOT_SAVE_DIR, exist_ok=True)
 plot_filename = f"Threshold_Analysis_{MODEL_NAME.replace('.pth', '')}.png"
 save_path = os.path.join(PLOT_SAVE_DIR, plot_filename)
@@ -196,11 +198,13 @@ plt.style.use('bmh')
 fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 fig.suptitle(f'Threshold Analysis: {MODEL_NAME}', fontsize=16)
 
+
 # --- Helper Function for Dynamic Legends ---
 def draw_detailed_lines(ax, val_at_max, val_at_eq, metric_name):
     """
-    Draws vertical lines and includes the specific metric value in the legend.
+    Draws vertical lines and includes the specific metric value in the legend
     """
+    
     label_max = f'Peak B-Acc T:{t_max_acc:.2f} ({metric_name}={val_at_max:.3f})'
     ax.axvline(t_max_acc, color='black', linestyle='--', alpha=0.6, label=label_max)
 
@@ -209,17 +213,18 @@ def draw_detailed_lines(ax, val_at_max, val_at_eq, metric_name):
     
     ax.legend(loc='lower left', fontsize=9)
 
-# Plot 1: Balanced Accuracy
+
+#Bal acc
 ax = axes[0, 0]
 ax.plot(thresholds, b_accs, color='#2ca02c', linewidth=2)
 ax.set_title('Balanced Accuracy')
 ax.set_xlabel('Threshold')
 ax.set_ylabel('Score')
-# Pass the B-Acc values at the critical thresholds
+
 draw_detailed_lines(ax, b_accs[idx_max], b_accs[idx_eq], "B-Acc")
 ax.grid(True, alpha=0.3)
 
-# Plot 2: Recall vs Specificity Crossing
+#Recall vs spec
 ax = axes[0, 1]
 ax.plot(thresholds, recalls, label='Recall', color='#9467bd', linewidth=2)
 ax.plot(thresholds, specificities, label='Specificity', color='#e377c2', linewidth=2)
@@ -227,7 +232,7 @@ ax.set_title('Recall vs Specificity (Crossing Point)')
 ax.set_xlabel('Threshold')
 ax.set_ylabel('Score')
 
-# Custom legend for the crossing plot
+#Legend
 rec_at_max = recalls[idx_max]
 spec_at_max = specificities[idx_max]
 ax.axvline(t_max_acc, color='black', linestyle='--', alpha=0.6, 
@@ -240,21 +245,21 @@ ax.axvline(t_equilibrium, color='blue', linestyle='-.', alpha=0.6,
 ax.legend(loc='lower left', fontsize=8)
 ax.grid(True, alpha=0.3)
 
-# Plot 3: Recall Alone
+#Recall 
 ax = axes[1, 0]
 ax.plot(thresholds, recalls, color='#9467bd', linewidth=2)
 ax.set_title('Recall (Sensitivity)')
 ax.set_xlabel('Threshold')
-# Pass Recall values
+
 draw_detailed_lines(ax, recalls[idx_max], recalls[idx_eq], "Rec")
 ax.grid(True, alpha=0.3)
 
-# Plot 4: Specificity Alone
+#Specificity
 ax = axes[1, 1]
 ax.plot(thresholds, specificities, color='#e377c2', linewidth=2)
 ax.set_title('Specificity (True Negative Rate)')
 ax.set_xlabel('Threshold')
-# Pass Specificity values
+
 draw_detailed_lines(ax, specificities[idx_max], specificities[idx_eq], "Spec")
 ax.grid(True, alpha=0.3)
 
@@ -262,3 +267,6 @@ plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.savefig(save_path, dpi=150)
 print(f"\nPlot saved to: {save_path}")
 plt.show()
+
+
+

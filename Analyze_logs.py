@@ -25,9 +25,9 @@ def analyze_training_logs():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-    #==========================================
+    ###########################################
     # Mertrics
-    #==========================================
+    ###########################################
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle('Training vs Validation Metrics', fontsize=16)
 
@@ -74,9 +74,9 @@ def analyze_training_logs():
     plt.close()
 
 
-    #==========================================
+    ###########################################
     #Treshold
-    #==========================================
+    ###########################################
     plt.figure(figsize=(10, 6))
     
     plt.plot(df['Epoch'], df['Thresh'], label='Optimal Threshold', color='darkblue', linewidth=2, marker='o', markersize=4)

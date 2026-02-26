@@ -83,8 +83,10 @@ def clean_checkpoints():
 
     print("\n" + "="*50)
     print(f"Done! Cleaned models are saved in:\n{OUTPUT_FOLDER}")
-    print("You can now load these files with weights_only=True")
     print("="*50)
 
 if __name__ == "__main__":
     clean_checkpoints()
+    
+    
+    
