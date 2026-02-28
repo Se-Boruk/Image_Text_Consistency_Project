@@ -47,7 +47,7 @@ The captions used were the standard ones (coco & flickr30k) but additional ones 
 First and basic one is just using other examples in the batch as negative samples. It is technique known as contrastive learning.
 
 #### Contrastive learning example. Loss function makes dot products of diagonal (positive samples) bigger, while making the rest of the matrix dot products smaller
-<img src="https://github.com/Se-Boruk/Image_Text_Consistency_Project/blob/master/Assets/Contrastive_learnin_example.png?raw=true" width="520">
+<img src="https://github.com/Se-Boruk/Image_Text_Consistency_Project/blob/master/Assets/Contrastive_learning_example.png?raw=true" width="520">
 
 Second one involved algorithmical creation of the negative samples by swapping words in the sentence.<br>
 It has been done this way to ensure that the model is also sensitive to small mismatches in the descriptions, e.g.<br>
@@ -67,22 +67,27 @@ Used techniques involved color jittering, cropping, grayscaling or blurring.
 ### It is important to note that both text negative examples and image augmentation were done dynamically during the training
 
 #### Examples of produced training samples
-<img src="https://github.com/Se-Boruk/Image_Text_Consistency_Project/blob/master/Assets/Data_visualisation_1.png?raw=true" width="640">
+<img src="https://github.com/Se-Boruk/Image_Text_Consistency_Project/blob/master/Assets/Data_visualisation_1.png?raw=true" width="720">
 
 
 ## Architectures & Training
 
 ### Architecture
 Final Model is variation of Siameese Network.<br>
-In one branch it has CNN (with ResNet50 pretrained backbone) and on the other one there is modified LSTM.
 
-Both of the network are producing vectors containing informations about the text and image contents. Then the cosine similarity is calculated to determine if the text describes the image well. If it is above given threshold, then 2 samples are classified as match. If not then as mismatch.
+Branch dedicated to extract features from image is CNN build on ResNet50 pretrained backbone.
+
+Brabch responsible for text feature extraction is modified version of bidirectional residual LSTM.
+
+During inference, the network calculates a patch-to-word cosine similarity matrix to ground individual text tokens to their most highly correlated image regions. The valid token scores are then averaged and evaluated against a given threshold to classify the pair as a match or mismatch.
+
+
 
 #### Architecture scheme
-<img src="https://github.com/Se-Boruk/Image_Text_Consistency_Project/blob/master/Assets/Contrastive_learnin_example.png?raw=true" width="520">
+<img src="https://github.com/Se-Boruk/Image_Text_Consistency_Project/blob/master/Assets/Architecture_scheme.png?raw=true" width="520">
 
 ### Training course
-Training used already combined triplet loss function (for hard negatives) and contrastive loss (for general knowledge).
+Training used combined triplet loss function (for hard negatives) and contrastive loss (for general knowledge).
 
 The training techniques used include half-precision to reduce computational overhead, gradient accumulation for artificially increasing batch size (important for contrastive loss)
 
@@ -99,7 +104,9 @@ At the end of the training the analysis of the best threshold has been performed
 To describe final results - what scores the model achieved and overal conclusion :)
 
 
-
+| 256x256 Input | SRCNN x4 Output (1024x204) |
+| :---: | :---: |
+| <img src="https://github.com/Se-Boruk/Virtual_conservator/blob/master/Assets/042222-256x256.png?raw=true" width="400" /> | <img src="https://github.com/Se-Boruk/Virtual_conservator/blob/master/Assets/result_1024x1024.png?raw=true" width="400" /> |
 
 
 
